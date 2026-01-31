@@ -1,0 +1,10 @@
+{
+  "connections": [
+    {
+      "conn_id": "netbox_default",
+      "conn_type": "http",
+      "host": "netbox",
+      "port": 8080
+    }
+  ]
+}

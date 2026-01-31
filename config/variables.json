@@ -1,0 +1,6 @@
+{
+  "variables": {
+    "jenkins_url": "http://automiq-jenkins:8080",
+    "vault_addr": "http://vault:8200"
+  }
+}
