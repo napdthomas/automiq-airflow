@@ -19,21 +19,18 @@ REDIS_HOST = "netbox-valkey-primary.core.svc.cluster.local"
 REDIS_PORT = 6379
 REDIS_PASSWORD = os.getenv("VALKEY_PASSWORD")
 
-
 def acquire_lock(lock_name: str, ttl: int = 300):
-    r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0)
+    r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD, db=0)
     if not r.set(lock_name, "locked", nx=True, ex=ttl):
         raise AirflowFailException(f"Lock already held for {lock_name}")
     logging.info(f"Lock acquired for {lock_name}")
 
-
 def release_lock(lock_name: str):
-    r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0)
+    r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD, db=0)
     deleted = r.delete(lock_name)
     if deleted == 0:
         raise AirflowFailException(f"Failed to release lock {lock_name}")
     logging.info(f"Lock released for {lock_name}")
-
 
 @task
 def ward_lock(target: str):
