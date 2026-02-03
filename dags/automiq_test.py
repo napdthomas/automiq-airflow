@@ -15,8 +15,9 @@ import base64
 NETBOX_URL = "http://netbox.local:30080/api"
 VAULT_ADDR = "http://vault.local:30080"
 VAULT_TOKEN = os.getenv("VAULT_TOKEN")
-REDIS_HOST = "automiq-netbox-redis-1"
+REDIS_HOST = "netbox-valkey-primary.core.svc.cluster.local"
 REDIS_PORT = 6379
+REDIS_PASSWORD = os.getenv("VALKEY_PASSWORD")
 
 
 def acquire_lock(lock_name: str, ttl: int = 300):
