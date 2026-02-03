@@ -1,22 +1,15 @@
-# /opt/airflow/dags/automiq_test.py
+# dags/automiq_test.py
 from airflow import DAG
-from airflow.models.param import Param
-from airflow.decorators import task, task_group
+from airflow.decorators import task
+from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
 from airflow.exceptions import AirflowFailException
-from airflow.models import Variable
-from airflow.utils.state import State
 from datetime import datetime, timedelta
 import json
 import logging
 import requests
 import redis
-import time
-import os
 
 # Config
-JENKINS_URL = "http://jenkins.local:30080"
-JENKINS_USER = "admin"
-JENKINS_TOKEN = os.getenv("JENKINS_TOKEN")
 NETBOX_URL = "http://netbox.local:30080/api"
 VAULT_ADDR = "http://vault.local:30080"
 VAULT_TOKEN = os.getenv("VAULT_TOKEN")
@@ -49,382 +42,117 @@ def ward_unlock(target: str):
     release_lock(f"{target}-lock")
 
 
-@task_group
-def call_netbox(target: str):
+@task
+def get_netbox_metadata(target: str):
+    """Get device metadata from NetBox"""
+    # Get NetBox token from Vault
+    resp = requests.get(
+        f"{VAULT_ADDR}/v1/secret/data/netbox",
+        headers={"X-Vault-Token": VAULT_TOKEN},
+    )
+    resp.raise_for_status()
+    netbox_token = resp.json()["data"]["data"]["netbox"]
+    
+    # Get device from NetBox
+    headers = {"Authorization": f"Token {netbox_token}"}
+    resp = requests.get(
+        f"{NETBOX_URL}/dcim/devices/?name={target}",
+        headers=headers,
+    )
+    resp.raise_for_status()
 
-    @task
-    def get_netbox_token(**context):
-        resp = requests.get(
-            f"{VAULT_ADDR}/v1/secret/data/netbox",
-            headers={"X-Vault-Token": VAULT_TOKEN},
-        )
-        resp.raise_for_status()
-        token = resp.json()["data"]["data"]["netbox"]
-        context["ti"].xcom_push(key="netbox_token", value=token)
+    if resp.json()["count"] == 0:
+        raise AirflowFailException(f"Device {target} not found")
 
-    @task
-    def get_device_metadata(target: str, **context):
-        token = context["ti"].xcom_pull(
-            key="netbox_token",
-            task_ids="call_netbox.get_netbox_token",
-        )
-        headers = {"Authorization": f"Token {token}"}
-        resp = requests.get(
-            f"{NETBOX_URL}/dcim/devices/?name={target}",
-            headers=headers,
-        )
-        resp.raise_for_status()
+    device = resp.json()["results"][0]
+    
+    return {
+        "target": target,
+        "site": device.get("site", {}).get("name"),
+        "role": device.get("device_role", {}).get("name"),
+        "manufacturer": device.get("device_type", {}).get("manufacturer", {}).get("name"),
+        "type": device.get("device_type", {}).get("model"),
+    }
 
-        if resp.json()["count"] == 0:
-            raise AirflowFailException(f"Device {target} not found")
 
-        device = resp.json()["results"][0]
-        role_obj = device.get("device_role")
-        device_type = device.get("device_type") or {}
-        manufacturer_obj = device_type.get("manufacturer") or {}
+def run_nornir_job(target: str, playbook: str, extra_vars: str):
+    """Run Nornir job directly in Kubernetes"""
+    return KubernetesPodOperator(
+        task_id='run_nornir',
+        namespace='ansible',
+        image='docker.io/nthomas48/nornir-runner:latest',
+        cmds=['/bin/bash', '-c'],
+        arguments=[f'''
+            set -euo pipefail
+            
+            echo "▶ Preparing workspace"
+            mkdir -p /workspace
+            cd /workspace
+            
+            echo "▶ Cloning Nornir repo"
+            git clone https://github.com/napdthomas/automiq-nornir.git repo
+            cd repo
+            
+            echo "▶ Running Nornir script"
+            if [ ! -f "scripts/{playbook}" ]; then
+              echo "❌ Script scripts/{playbook} not found" >&2
+              exit 10
+            fi
+            
+            python scripts/{playbook} {target}
+        '''],
+        name=f'nornir-{target.replace(".", "-").replace("_", "-")}',
+        is_delete_operator_pod=True,
+        get_logs=True,
+    )
 
-        meta = {
-            "Site": device.get("site", {}).get("name"),
-            "Role": role_obj["name"] if role_obj else None,
-            "Manufacturer": manufacturer_obj.get("name"),
-            "Type": device_type.get("model"),
+
+def run_ansible_job(target: str, playbook: str, extra_vars: str):
+    """Run Ansible job directly in Kubernetes"""
+    # Encode extra vars to base64
+    import base64
+    extra_vars_b64 = base64.b64encode(extra_vars.encode()).decode()
+    
+    return KubernetesPodOperator(
+        task_id='run_ansible',
+        namespace='ansible',
+        image='docker.io/nthomas48/ansible-ara-runner:latest',
+        cmds=['/bin/bash', '-c'],
+        arguments=[f'''
+            set -euo pipefail
+
+            # decode extra vars
+            if [ -n "{extra_vars_b64}" ]; then
+              echo "{extra_vars_b64}" | base64 -d > /tmp/extra_vars.json
+            else
+              echo "{{}}" > /tmp/extra_vars.json
+            fi
+
+            # clone repo
+            mkdir -p /workspace
+            cd /workspace
+            git clone https://github.com/napdthomas/automiq-ansible.git repo
+            cd repo
+
+            # ensure playbook exists
+            if [ ! -f "playbooks/{playbook}" ]; then
+              printf 'Playbook not found\\n' >&2
+              exit 10
+            fi
+
+            # run playbook
+            ansible-playbook playbooks/{playbook} \\
+              -i "{target}," \\
+              --extra-vars @/tmp/extra_vars.json
+        '''],
+        name=f'ansible-{target.replace(".", "-").replace("_", "-")}',
+        is_delete_operator_pod=True,
+        get_logs=True,
+        env_vars={
+            'ANSIBLE_STDOUT_CALLBACK': 'default',
+            'ANSIBLE_HOST_KEY_CHECKING': 'False',
         }
-
-        context["ti"].xcom_push(key="device_metadata", value=meta)
-
-    get_netbox_token() >> get_device_metadata(target)
-
-
-# =========================
-# Jenkins ping
-# =========================
-@task_group
-def call_nornir_job(params: dict):
-
-    @task
-    def trigger_ping_job(params: dict, **context):
-        normalized = {}
-        for k, v in params.items():
-            if isinstance(v, Param):
-                if hasattr(v, "value") and v.value is not None:
-                    normalized[k] = v.value
-                elif hasattr(v, "default") and v.default is not None:
-                    normalized[k] = v.default
-                else:
-                    normalized[k] = str(v)
-            else:
-                normalized[k] = v
-
-        jenkins_params = {
-            "TARGET": normalized.get("target"),
-            "PLAYBOOK": "nornir_ping.py",
-            "EXTRA_VARS": normalized.get("extra_vars", ""),
-        }
-
-        job_name = "run_nornir_job"
-        url = f"{JENKINS_URL}/job/{job_name}/buildWithParameters"
-
-        resp = requests.post(
-            url,
-            params=jenkins_params,
-            auth=(JENKINS_USER, JENKINS_TOKEN),
-        )
-        resp.raise_for_status()
-
-        queue_url = resp.headers.get("Location")
-        if not queue_url:
-            raise AirflowFailException("Failed to get Jenkins queue location")
-
-        build_number = None
-        for _ in range(30):
-            q = requests.get(
-                f"{queue_url}api/json",
-                auth=(JENKINS_USER, JENKINS_TOKEN),
-            )
-            q.raise_for_status()
-            data = q.json()
-            if data.get("executable"):
-                build_number = data["executable"]["number"]
-                break
-            time.sleep(2)
-
-        if build_number is None:
-            raise AirflowFailException("Failed to get Jenkins build number")
-
-        return build_number
-
-    @task
-    def poll_ping_job(build_number: int, params: dict):
-        job_name = "run_nornir_job"
-        while True:
-            r = requests.get(
-                f"{JENKINS_URL}/job/{job_name}/{build_number}/api/json",
-                auth=(JENKINS_USER, JENKINS_TOKEN),
-            )
-            r.raise_for_status()
-            data = r.json()
-            if not data.get("building"):
-                if data.get("result") != "SUCCESS":
-                    raise AirflowFailException(
-                        f"Jenkins job failed: {data.get('result')}"
-                    )
-                break
-            time.sleep(5)
-
-    build = trigger_ping_job(params=params)
-    poll_ping_job(build_number=build, params=params)
-
-
-# =========================
-# Jenkins ansible
-# =========================
-@task_group
-def call_ansible_job(params: dict):
-
-    @task
-    def trigger_ansible_job(params: dict, **context):
-        normalized = {}
-        for k, v in params.items():
-            if isinstance(v, Param):
-                if hasattr(v, "value") and v.value is not None:
-                    normalized[k] = v.value
-                elif hasattr(v, "default") and v.default is not None:
-                    normalized[k] = v.default
-                else:
-                    normalized[k] = str(v)
-            else:
-                normalized[k] = v
-
-        jenkins_params = {
-            "TARGET": normalized.get("target"),
-            "PLAYBOOK": normalized.get("playbook"),
-            "EXTRA_VARS": normalized.get("extra_vars", ""),
-        }
-
-        job_name = "run_ansible_job"
-        url = f"{JENKINS_URL}/job/{job_name}/buildWithParameters"
-
-        resp = requests.post(
-            url,
-            params=jenkins_params,
-            auth=(JENKINS_USER, JENKINS_TOKEN),
-        )
-        resp.raise_for_status()
-
-        queue_url = resp.headers.get("Location")
-        if not queue_url:
-            raise AirflowFailException("Failed to get Jenkins queue location")
-
-        build_number = None
-        for _ in range(30):
-            q = requests.get(
-                f"{queue_url}api/json",
-                auth=(JENKINS_USER, JENKINS_TOKEN),
-            )
-            q.raise_for_status()
-            data = q.json()
-            if data.get("executable"):
-                build_number = data["executable"]["number"]
-                break
-            time.sleep(2)
-
-        if build_number is None:
-            raise AirflowFailException("Failed to get Jenkins build number")
-
-        return build_number
-
-    @task
-    def poll_ansible_job(build_number: int, params: dict):
-        job_name = "run_ansible_job"
-        while True:
-            r = requests.get(
-                f"{JENKINS_URL}/job/{job_name}/{build_number}/api/json",
-                auth=(JENKINS_USER, JENKINS_TOKEN),
-            )
-            r.raise_for_status()
-            data = r.json()
-            if not data.get("building"):
-                if data.get("result") != "SUCCESS":
-                    raise AirflowFailException(
-                        f"Jenkins job failed: {data.get('result')}"
-                    )
-                break
-            time.sleep(5)
-
-    build = trigger_ansible_job(params=params)
-    poll_ansible_job(build_number=build, params=params)
-
-
-# =========================
-# Jenkins Slack Job
-# =========================
-@task_group
-def call_slack_job():
-
-    @task(trigger_rule="all_done")
-    def trigger_slack_job(**context):
-        dag_run = context["dag_run"]
-        tis = dag_run.get_task_instances()
-
-        failed_tis = [
-            ti for ti in tis
-            if ti.state == State.FAILED
-            and ti.task_id not in {"call_slack_job.trigger_slack_job"}
-        ]
-
-        if not failed_tis:
-            logging.info("No failures; skipping Slack Jenkins job.")
-            return None
-
-        ti = failed_tis[0]
-
-        jenkins_params = {
-            "DAG_ID": dag_run.dag_id,
-            "RUN_ID": dag_run.run_id,
-            "TASK_ID": ti.task_id,
-        }
-
-        job_name = "run_slack_job"
-        url = f"{JENKINS_URL}/job/{job_name}/buildWithParameters"
-
-        resp = requests.post(
-            url,
-            params=jenkins_params,
-            auth=(JENKINS_USER, JENKINS_TOKEN),
-        )
-        resp.raise_for_status()
-
-        queue_url = resp.headers.get("Location")
-        if not queue_url:
-            raise AirflowFailException("Failed to get Jenkins queue location")
-
-        build_number = None
-        for _ in range(30):
-            q = requests.get(
-                f"{queue_url}api/json",
-                auth=(JENKINS_USER, JENKINS_TOKEN),
-            )
-            q.raise_for_status()
-            data = q.json()
-            if data.get("executable"):
-                build_number = data["executable"]["number"]
-                break
-            time.sleep(2)
-
-        if build_number is None:
-            raise AirflowFailException("Failed to get Jenkins build number")
-
-        return build_number
-
-    @task(trigger_rule="all_done")
-    def poll_slack_job(build_number: int):
-        if build_number is None:
-            return
-
-        job_name = "run_slack_job"
-        while True:
-            r = requests.get(
-                f"{JENKINS_URL}/job/{job_name}/{build_number}/api/json",
-                auth=(JENKINS_USER, JENKINS_TOKEN),
-            )
-            r.raise_for_status()
-            data = r.json()
-            if not data.get("building"):
-                if data.get("result") != "SUCCESS":
-                    raise AirflowFailException(
-                        f"Slack Jenkins job failed: {data.get('result')}"
-                    )
-                break
-            time.sleep(5)
-
-    build = trigger_slack_job()
-    poll_slack_job(build_number=build)
-
-
-# =========================
-# Jenkins JIRA Job
-# =========================
-@task_group
-def call_jira_job():
-
-    @task(trigger_rule="all_done")
-    def trigger_jira_job(**context):
-        dag_run = context["dag_run"]
-        tis = dag_run.get_task_instances()
-
-        failed_tis = [
-            ti for ti in tis
-            if ti.state == State.FAILED
-            and ti.task_id not in {"call_jira_job.trigger_jira_job"}
-        ]
-
-        if not failed_tis:
-            logging.info("No failures; skipping JIRA Jenkins job.")
-            return None
-
-        ti = failed_tis[0]
-
-        jenkins_params = {
-            "DAG_ID": dag_run.dag_id,
-            "RUN_ID": dag_run.run_id,
-            "TASK_ID": ti.task_id,
-        }
-
-        job_name = "run_jira_job"
-        url = f"{JENKINS_URL}/job/{job_name}/buildWithParameters"
-
-        resp = requests.post(
-            url,
-            params=jenkins_params,
-            auth=(JENKINS_USER, JENKINS_TOKEN),
-        )
-        resp.raise_for_status()
-
-        queue_url = resp.headers.get("Location")
-        if not queue_url:
-            raise AirflowFailException("Failed to get Jenkins queue location")
-
-        build_number = None
-        for _ in range(30):
-            q = requests.get(
-                f"{queue_url}api/json",
-                auth=(JENKINS_USER, JENKINS_TOKEN),
-            )
-            q.raise_for_status()
-            data = q.json()
-            if data.get("executable"):
-                build_number = data["executable"]["number"]
-                break
-            time.sleep(2)
-
-        if build_number is None:
-            raise AirflowFailException("Failed to get Jenkins build number")
-
-        return build_number
-
-    @task(trigger_rule="all_done")
-    def poll_jira_job(build_number: int):
-        if build_number is None:
-            return
-
-        job_name = "run_jira_job"
-        while True:
-            r = requests.get(
-                f"{JENKINS_URL}/job/{job_name}/{build_number}/api/json",
-                auth=(JENKINS_USER, JENKINS_TOKEN),
-            )
-            r.raise_for_status()
-            data = r.json()
-            if not data.get("building"):
-                if data.get("result") != "SUCCESS":
-                    raise AirflowFailException(
-                        f"JIRA Jenkins job failed: {data.get('result')}"
-                    )
-                break
-            time.sleep(5)
-
-    build = trigger_jira_job()
-    poll_jira_job(build_number=build)
+    )
 
 
 default_args = {
@@ -435,23 +163,32 @@ default_args = {
 }
 
 with DAG(
-    "automiq_test",
+    "automiq_test_k8s",
     default_args=default_args,
     schedule=None,
     catchup=False,
     params={
         "target": "clab-netauto-lab-ceos1",
         "playbook": "eos_system_baseline.yaml",
-        "extra_vars": "{\"interface\":\"Ethernet1\",\"description\":\"automation test\"}",
+        "extra_vars": '{"interface":"Ethernet1","description":"automation test"}',
     },
 ) as dag:
 
     lock = ward_lock("{{ params.target }}")
-    netbox = call_netbox("{{ params.target }}")
-    jenkins_ping = call_nornir_job(params=dag.params)
-    jenkins = call_ansible_job(params=dag.params)
+    metadata = get_netbox_metadata("{{ params.target }}")
+    
+    nornir = run_nornir_job(
+        target="{{ params.target }}",
+        playbook="nornir_ping.py",
+        extra_vars="{{ params.extra_vars }}"
+    )
+    
+    ansible = run_ansible_job(
+        target="{{ params.target }}",
+        playbook="{{ params.playbook }}",
+        extra_vars="{{ params.extra_vars }}"
+    )
+    
     unlock = ward_unlock("{{ params.target }}")
-    slack = call_slack_job()
-    jira = call_jira_job()
 
-    lock >> netbox >> jenkins_ping >> jenkins >> unlock >> slack >> jira
+    lock >> metadata >> nornir >> ansible >> unlock
