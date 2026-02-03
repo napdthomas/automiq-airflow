@@ -8,6 +8,8 @@ import json
 import logging
 import requests
 import redis
+import os
+import base64
 
 # Config
 NETBOX_URL = "http://netbox.local:30080/api"
