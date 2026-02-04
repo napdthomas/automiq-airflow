@@ -12,8 +12,8 @@ import os
 import base64
 
 # Config
-NETBOX_URL = "http://netbox.local:30080/api"
-VAULT_ADDR = "http://vault.local:30080"
+NETBOX_URL = "http://netbox.core.svc.cluster.local/api"
+VAULT_ADDR = "http://vault.core.svc.cluster.local:8200"
 VAULT_TOKEN = os.getenv("VAULT_TOKEN")
 REDIS_HOST = "netbox-valkey-primary.core.svc.cluster.local"
 REDIS_PORT = 6379
