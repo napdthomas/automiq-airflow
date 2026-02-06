@@ -68,13 +68,126 @@ def get_netbox_metadata(target: str):
 
     device = resp.json()["results"][0]
     
+    # Extract management IP (remove subnet mask)
+    primary_ip = device.get("primary_ip4", {}).get("address", "")
+    management_ip = primary_ip.split("/")[0] if primary_ip else ""
+    
+    if not management_ip:
+        raise AirflowFailException(f"Device {target} has no management IP")
+    
     return {
         "target": target,
-        "site": device.get("site", {}).get("name"),
-        "role": device.get("device_role", {}).get("name"),
-        "manufacturer": device.get("device_type", {}).get("manufacturer", {}).get("name"),
-        "type": device.get("device_type", {}).get("model"),
+        "management_ip": management_ip,
+        "site": device.get("site", {}).get("name", ""),
+        "role": device.get("role", {}).get("name", ""),
+        "manufacturer": device.get("device_type", {}).get("manufacturer", {}).get("name", ""),
+        "type": device.get("device_type", {}).get("model", ""),
     }
+
+
+@task
+def run_nornir_job(metadata: dict):
+    """Run Nornir job with metadata from NetBox"""
+    from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
+    
+    # Pass metadata as environment variables
+    env_vars = {
+        'TARGET_IP': metadata['management_ip'],
+        'TARGET_NAME': metadata['target'],
+        'SITE': metadata.get('site', ''),
+        'ROLE': metadata.get('role', ''),
+        'MANUFACTURER': metadata.get('manufacturer', ''),
+        'TYPE': metadata.get('type', ''),
+    }
+    
+    op = KubernetesPodOperator(
+        task_id='run_nornir_k8s',
+        namespace='ansible',
+        image='docker.io/nthomas48/nornir-runner:latest',
+        cmds=['/bin/bash', '-c'],
+        arguments=['''
+            set -euo pipefail
+            
+            echo "▶ Preparing workspace"
+            mkdir -p /workspace && cd /workspace
+            
+            echo "▶ Cloning Nornir repo"
+            git clone https://github.com/napdthomas/automiq-nornir.git repo
+            cd repo
+            
+            echo "▶ Running Nornir script"
+            echo "Target: $TARGET_NAME ($TARGET_IP)"
+            echo "Metadata: site=$SITE, role=$ROLE, manufacturer=$MANUFACTURER, type=$TYPE"
+            
+            # Pass target name (script will use TARGET_IP env var)
+            python scripts/nornir_ping.py --target $TARGET_NAME
+        '''],
+        name=f"nornir-{metadata['target'].replace('.', '-').replace('_', '-')}",
+        env_vars=env_vars,
+        is_delete_operator_pod=False,  # Keep pod for debugging
+        get_logs=True,
+    )
+    
+    return op.execute(context={})
+
+
+@task
+def run_ansible_job(metadata: dict, playbook: str, extra_vars: str):
+    """Run Ansible job with metadata from NetBox"""
+    from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
+    import json
+    
+    # Merge extra_vars with metadata
+    try:
+        extra = json.loads(extra_vars) if extra_vars else {}
+    except:
+        extra = {}
+    
+    extra.update({
+        'target_ip': metadata['management_ip'],
+        'target_name': metadata['target'],
+        'site': metadata.get('site', ''),
+        'role': metadata.get('role', ''),
+    })
+    
+    extra_vars_json = json.dumps(extra)
+    
+    op = KubernetesPodOperator(
+        task_id='run_ansible_k8s',
+        namespace='ansible',
+        image='docker.io/nthomas48/ansible-ara-runner:latest',
+        cmds=['/bin/bash', '-c'],
+        arguments=[f'''
+            set -euo pipefail
+
+            echo '{extra_vars_json}' > /tmp/extra_vars.json
+
+            mkdir -p /workspace && cd /workspace
+            git clone https://github.com/napdthomas/automiq-ansible.git repo
+            cd repo
+
+            if [ ! -f "playbooks/{playbook}" ]; then
+              echo "Playbook not found" >&2
+              exit 10
+            fi
+
+            echo "Running playbook: {playbook}"
+            echo "Target: {metadata['management_ip']}"
+            
+            ansible-playbook playbooks/{playbook} \
+              -i "{metadata['management_ip']}," \
+              --extra-vars @/tmp/extra_vars.json
+        '''],
+        name=f"ansible-{metadata['target'].replace('.', '-').replace('_', '-')}",
+        env_vars={
+            'ANSIBLE_STDOUT_CALLBACK': 'default',
+            'ANSIBLE_HOST_KEY_CHECKING': 'False',
+        },
+        is_delete_operator_pod=False,  # Keep pod for debugging
+        get_logs=True,
+    )
+    
+    return op.execute(context={})
 
 
 default_args = {
@@ -98,63 +211,8 @@ with DAG(
 
     lock = ward_lock("{{ params.target }}")
     metadata = get_netbox_metadata("{{ params.target }}")
-    
-    # Instantiate KubernetesPodOperator directly (not via function)
-    nornir = KubernetesPodOperator(
-        task_id='run_nornir',
-        namespace='ansible',
-        image='docker.io/nthomas48/nornir-runner:latest',
-        cmds=['/bin/bash', '-c'],
-        arguments=['''
-            set -euo pipefail
-            
-            echo "▶ Preparing workspace"
-            mkdir -p /workspace && cd /workspace
-            
-            echo "▶ Cloning Nornir repo"
-            git clone https://github.com/napdthomas/automiq-nornir.git repo
-            cd repo
-            
-            echo "▶ Running Nornir script"
-            python scripts/nornir_ping.py {{ params.target }}
-        '''],
-        name='nornir-{{ params.target | replace(".", "-") | replace("_", "-") }}',
-        is_delete_operator_pod=True,
-        get_logs=True,
-    )
-    
-    ansible = KubernetesPodOperator(
-        task_id='run_ansible',
-        namespace='ansible',
-        image='docker.io/nthomas48/ansible-ara-runner:latest',
-        cmds=['/bin/bash', '-c'],
-        arguments=['''
-            set -euo pipefail
-
-            echo "{}" > /tmp/extra_vars.json
-
-            mkdir -p /workspace && cd /workspace
-            git clone https://github.com/napdthomas/automiq-ansible.git repo
-            cd repo
-
-            if [ ! -f "playbooks/{{ params.playbook }}" ]; then
-              echo "Playbook not found" >&2
-              exit 10
-            fi
-
-            ansible-playbook playbooks/{{ params.playbook }} \
-              -i "{{ params.target }}," \
-              --extra-vars @/tmp/extra_vars.json
-        '''],
-        name='ansible-{{ params.target | replace(".", "-") | replace("_", "-") }}',
-        is_delete_operator_pod=True,
-        get_logs=True,
-        env_vars={
-            'ANSIBLE_STDOUT_CALLBACK': 'default',
-            'ANSIBLE_HOST_KEY_CHECKING': 'False',
-        }
-    )
-    
+    nornir = run_nornir_job(metadata)
+    ansible = run_ansible_job(metadata, "{{ params.playbook }}", "{{ params.extra_vars }}")
     unlock = ward_unlock("{{ params.target }}")
 
     lock >> metadata >> nornir >> ansible >> unlock
