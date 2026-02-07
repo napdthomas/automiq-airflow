@@ -85,23 +85,31 @@ def get_netbox_metadata(target: str):
     }
 
 
-@task
-def run_nornir_job(metadata: dict):
-    """Run Nornir job with metadata from NetBox"""
-    from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
+default_args = {
+    "owner": "automiq",
+    "start_date": datetime(2025, 1, 1),
+    "retries": 2,
+    "retry_delay": timedelta(seconds=20),
+}
+
+with DAG(
+    "automiq_test_k8s",
+    default_args=default_args,
+    schedule=None,
+    catchup=False,
+    params={
+        "target": "clab-netauto-lab-juno1",
+        "playbook": "junos_system_baseline.yaml",
+        "extra_vars": '{}',
+    },
+) as dag:
+
+    lock = ward_lock("{{ params.target }}")
+    metadata = get_netbox_metadata("{{ params.target }}")
     
-    # Pass metadata as environment variables
-    env_vars = {
-        'TARGET_IP': metadata['management_ip'],
-        'TARGET_NAME': metadata['target'],
-        'SITE': metadata.get('site', ''),
-        'ROLE': metadata.get('role', ''),
-        'MANUFACTURER': metadata.get('manufacturer', ''),
-        'TYPE': metadata.get('type', ''),
-    }
-    
-    op = KubernetesPodOperator(
-        task_id='run_nornir_k8s',
+    # Create Nornir task - uses XCom to get metadata
+    nornir = KubernetesPodOperator(
+        task_id='run_nornir',
         namespace='ansible',
         image='docker.io/nthomas48/nornir-runner:latest',
         cmds=['/bin/bash', '-c'],
@@ -117,100 +125,56 @@ def run_nornir_job(metadata: dict):
             
             echo "▶ Running Nornir script"
             echo "Target: $TARGET_NAME ($TARGET_IP)"
-            echo "Metadata: site=$SITE, role=$ROLE, manufacturer=$MANUFACTURER, type=$TYPE"
-            
-            # Pass target name (script will use TARGET_IP env var)
             python scripts/nornir_ping.py --target $TARGET_NAME
         '''],
-        name=f"nornir-{metadata['target'].replace('.', '-').replace('_', '-')}",
-        env_vars=env_vars,
-        is_delete_operator_pod=False,  # Keep pod for debugging
-        get_logs=True,
-    )
-    
-    return op.execute(context={})
-
-
-@task
-def run_ansible_job(metadata: dict, playbook: str, extra_vars: str):
-    """Run Ansible job with metadata from NetBox"""
-    from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
-    import json
-    
-    # Merge extra_vars with metadata
-    try:
-        extra = json.loads(extra_vars) if extra_vars else {}
-    except:
-        extra = {}
-    
-    extra.update({
-        'target_ip': metadata['management_ip'],
-        'target_name': metadata['target'],
-    })
-    
-    extra_vars_json = json.dumps(extra)
-    
-    op = KubernetesPodOperator(
-        task_id='run_ansible_k8s',
-        namespace='ansible',
-        image='docker.io/nthomas48/ansible-ara-runner:latest',
-        cmds=['/bin/bash', '-c'],
-        arguments=[f'''
-            set -euo pipefail
-
-            echo '{extra_vars_json}' > /tmp/extra_vars.json
-
-            mkdir -p /workspace && cd /workspace
-            git clone https://github.com/napdthomas/automiq-ansible.git repo
-            cd repo
-
-            if [ ! -f "playbooks/{playbook}" ]; then
-              echo "Playbook not found" >&2
-              exit 10
-            fi
-
-            echo "Running playbook: {playbook}"
-            echo "Target: {metadata['management_ip']}"
-            
-            ansible-playbook playbooks/{playbook} \
-              -i "{metadata['management_ip']}," \
-              --extra-vars @/tmp/extra_vars.json
-        '''],
-        name=f"ansible-{metadata['target'].replace('.', '-').replace('_', '-')}",
+        name='nornir-{{ ti.xcom_pull(task_ids="get_netbox_metadata")["target"] | replace(".", "-") | replace("_", "-") }}',
         env_vars={
-            'ANSIBLE_STDOUT_CALLBACK': 'default',
-            'ANSIBLE_HOST_KEY_CHECKING': 'False',
-            'VAULT_TOKEN': VAULT_TOKEN,  # Pass Vault token to pod
+            'TARGET_IP': '{{ ti.xcom_pull(task_ids="get_netbox_metadata")["management_ip"] }}',
+            'TARGET_NAME': '{{ ti.xcom_pull(task_ids="get_netbox_metadata")["target"] }}',
         },
         is_delete_operator_pod=False,
         get_logs=True,
     )
     
-    return op.execute(context={})
+    # Create Ansible task - uses XCom to get metadata
+    ansible = KubernetesPodOperator(
+        task_id='run_ansible',
+        namespace='ansible',
+        image='docker.io/nthomas48/ansible-ara-runner:latest',
+        cmds=['/bin/bash', '-c'],
+        arguments=['''
+            set -euo pipefail
 
-default_args = {
-    "owner": "automiq",
-    "start_date": datetime(2025, 1, 1),
-    "retries": 2,
-    "retry_delay": timedelta(seconds=20),
-}
+            echo '{{ params.extra_vars }}' > /tmp/extra_vars.json
 
-with DAG(
-    "automiq_test_k8s",
-    default_args=default_args,
-    schedule=None,
-    catchup=False,
-    params={
-        "target": "clab-netauto-lab-juno1",
-        "playbook": "eos_system_baseline.yaml",
-        "extra_vars": '{}',
-    },
-) as dag:
+            mkdir -p /workspace && cd /workspace
+            git clone https://github.com/napdthomas/automiq-ansible.git repo
+            cd repo
 
-    lock = ward_lock("{{ params.target }}")
-    metadata = get_netbox_metadata("{{ params.target }}")
-    nornir = run_nornir_job(metadata)
-    ansible = run_ansible_job(metadata, "{{ params.playbook }}", "{{ params.extra_vars }}")
+            if [ ! -f "playbooks/{{ params.playbook }}" ]; then
+              echo "Playbook not found" >&2
+              exit 10
+            fi
+
+            echo "Running playbook: {{ params.playbook }}"
+            echo "Target: $TARGET_IP"
+            
+            ansible-playbook playbooks/{{ params.playbook }} \
+              -i "$TARGET_IP," \
+              --extra-vars @/tmp/extra_vars.json
+        '''],
+        name='ansible-{{ ti.xcom_pull(task_ids="get_netbox_metadata")["target"] | replace(".", "-") | replace("_", "-") }}',
+        env_vars={
+            'ANSIBLE_STDOUT_CALLBACK': 'default',
+            'ANSIBLE_HOST_KEY_CHECKING': 'False',
+            'VAULT_TOKEN': VAULT_TOKEN,
+            'TARGET_IP': '{{ ti.xcom_pull(task_ids="get_netbox_metadata")["management_ip"] }}',
+            'TARGET_NAME': '{{ ti.xcom_pull(task_ids="get_netbox_metadata")["target"] }}',
+        },
+        is_delete_operator_pod=False,
+        get_logs=True,
+    )
+    
     unlock = ward_unlock("{{ params.target }}")
 
     lock >> metadata >> nornir >> ansible >> unlock
