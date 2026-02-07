@@ -146,8 +146,6 @@ def run_ansible_job(metadata: dict, playbook: str, extra_vars: str):
     extra.update({
         'target_ip': metadata['management_ip'],
         'target_name': metadata['target'],
-        'site': metadata.get('site', ''),
-        'role': metadata.get('role', ''),
     })
     
     extra_vars_json = json.dumps(extra)
@@ -182,13 +180,13 @@ def run_ansible_job(metadata: dict, playbook: str, extra_vars: str):
         env_vars={
             'ANSIBLE_STDOUT_CALLBACK': 'default',
             'ANSIBLE_HOST_KEY_CHECKING': 'False',
+            'VAULT_TOKEN': VAULT_TOKEN,  # Pass Vault token to pod
         },
-        is_delete_operator_pod=False,  # Keep pod for debugging
+        is_delete_operator_pod=False,
         get_logs=True,
     )
     
     return op.execute(context={})
-
 
 default_args = {
     "owner": "automiq",
