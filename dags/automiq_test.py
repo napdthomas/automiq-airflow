@@ -3,7 +3,6 @@ from airflow import DAG
 from airflow.decorators import task
 from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
 from airflow.exceptions import AirflowFailException
-from airflow.models import State
 from datetime import datetime, timedelta
 import json
 import logging
@@ -107,7 +106,7 @@ def send_slack_notification(**context):
     # Find failed tasks (excluding notification and status check tasks)
     failed_tis = [
         ti for ti in tis
-        if ti.state == State.FAILED
+        if ti.state == 'failed'
         and ti.task_id not in {"send_slack_notification", "create_jira_issue", "check_workflow_status"}
     ]
     
@@ -174,7 +173,7 @@ def create_jira_issue(**context):
     # Find failed tasks (excluding notification and status check tasks)
     failed_tis = [
         ti for ti in tis
-        if ti.state == State.FAILED
+        if ti.state == 'failed'
         and ti.task_id not in {"send_slack_notification", "create_jira_issue", "check_workflow_status"}
     ]
     
@@ -442,4 +441,5 @@ with DAG(
     jira_issue = create_jira_issue()
     status_check = check_workflow_status()
 
+    # DAG structure: Always unlock, send notifications in parallel, then check status
     lock >> metadata >> nornir >> ansible >> unlock >> [slack_notify, jira_issue] >> status_check
