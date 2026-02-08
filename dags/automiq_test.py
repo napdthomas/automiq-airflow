@@ -10,6 +10,7 @@ import logging
 import requests
 import redis
 import os
+import base64
 
 # Config
 NETBOX_URL = "http://netbox.core.svc.cluster.local/api"
@@ -19,6 +20,8 @@ REDIS_HOST = "netbox-valkey-primary.core.svc.cluster.local"
 REDIS_PORT = 6379
 REDIS_PASSWORD = os.getenv("VALKEY_PASSWORD")
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
+JIRA_USER = os.getenv("JIRA_USER")
+JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
 
 
 def acquire_lock(lock_name: str, ttl: int = 300):
@@ -101,11 +104,11 @@ def send_slack_notification(**context):
     dag_run = context["dag_run"]
     tis = dag_run.get_task_instances()
     
-    # Find failed tasks (excluding this notification task and status check)
+    # Find failed tasks (excluding notification and status check tasks)
     failed_tis = [
         ti for ti in tis
         if ti.state == State.FAILED
-        and ti.task_id not in {"send_slack_notification", "check_workflow_status"}
+        and ti.task_id not in {"send_slack_notification", "create_jira_issue", "check_workflow_status"}
     ]
     
     if not failed_tis:
@@ -154,6 +157,180 @@ kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- \\
 
 
 @task(trigger_rule="all_done")
+def create_jira_issue(**context):
+    """Create Jira issue on task failure"""
+    JIRA_BASE_URL = "https://automiq-automation.atlassian.net"
+    JIRA_PROJECT_KEY = "KAN"
+    JIRA_USER = os.getenv("JIRA_USER")
+    JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
+    
+    if not JIRA_USER or not JIRA_API_TOKEN:
+        logging.error("JIRA_USER or JIRA_API_TOKEN environment variable not set")
+        return "Jira credentials not configured"
+    
+    dag_run = context["dag_run"]
+    tis = dag_run.get_task_instances()
+    
+    # Find failed tasks (excluding notification and status check tasks)
+    failed_tis = [
+        ti for ti in tis
+        if ti.state == State.FAILED
+        and ti.task_id not in {"send_slack_notification", "create_jira_issue", "check_workflow_status"}
+    ]
+    
+    if not failed_tis:
+        logging.info("No failures; skipping Jira issue creation.")
+        return None
+    
+    # Get first failed task for Jira issue
+    ti = failed_tis[0]
+    
+    # Build kubectl command to view logs
+    log_command = (
+        f"kubectl logs -n airflow airflow-scheduler-0 -c scheduler --tail=200 | "
+        f"grep -A 50 '{ti.task_id}'"
+    )
+    
+    status_command = (
+        f"kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- "
+        f"airflow tasks states-for-dag-run {dag_run.dag_id} {dag_run.run_id}"
+    )
+    
+    # Create Jira issue payload (API v3 format)
+    payload = {
+        "fields": {
+            "project": {
+                "key": JIRA_PROJECT_KEY
+            },
+            "summary": f":x: Airflow Task Failed - {dag_run.dag_id}:{ti.task_id}",
+            "description": {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Airflow Task Failed\n\n"
+                            }
+                        ]
+                    },
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"DAG: {dag_run.dag_id}\n",
+                                "marks": [{"type": "strong"}]
+                            }
+                        ]
+                    },
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"Run ID: {dag_run.run_id}\n"
+                            }
+                        ]
+                    },
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"Failed Task: {ti.task_id}\n"
+                            }
+                        ]
+                    },
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"State: {ti.state}\n"
+                            }
+                        ]
+                    },
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "\nView logs with:\n"
+                            }
+                        ]
+                    },
+                    {
+                        "type": "codeBlock",
+                        "attrs": {"language": "bash"},
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": log_command
+                            }
+                        ]
+                    },
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "\nView all task states:\n"
+                            }
+                        ]
+                    },
+                    {
+                        "type": "codeBlock",
+                        "attrs": {"language": "bash"},
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": status_command
+                            }
+                        ]
+                    }
+                ]
+            },
+            "issuetype": {
+                "name": "Task"
+            }
+        }
+    }
+    
+    # Create Basic Auth header
+    auth_string = f"{JIRA_USER}:{JIRA_API_TOKEN}"
+    auth_bytes = auth_string.encode('ascii')
+    base64_bytes = base64.b64encode(auth_bytes)
+    base64_auth = base64_bytes.decode('ascii')
+    
+    headers = {
+        "Authorization": f"Basic {base64_auth}",
+        "Content-Type": "application/json"
+    }
+    
+    try:
+        resp = requests.post(
+            f"{JIRA_BASE_URL}/rest/api/3/issue",
+            json=payload,
+            headers=headers,
+            timeout=10
+        )
+        resp.raise_for_status()
+        issue_data = resp.json()
+        issue_key = issue_data.get("key")
+        issue_url = f"{JIRA_BASE_URL}/browse/{issue_key}"
+        
+        logging.info(f"Jira issue created: {issue_key} - {issue_url}")
+        return f"Created Jira issue: {issue_key}"
+    except Exception as e:
+        logging.error(f"Failed to create Jira issue: {e}")
+        # Don't fail the DAG if Jira issue creation fails
+        return f"Jira issue creation failed: {e}"
+
+
+@task(trigger_rule="all_done")
 def check_workflow_status(**context):
     """Check if any upstream tasks failed and fail the DAG if so"""
     dag_run = context['dag_run']
@@ -161,7 +338,7 @@ def check_workflow_status(**context):
     # Get all task instances for this DAG run
     failed_tasks = []
     for task_instance in dag_run.get_task_instances():
-        if task_instance.state == 'failed' and task_instance.task_id not in ['ward_unlock', 'send_slack_notification', 'check_workflow_status']:
+        if task_instance.state == 'failed' and task_instance.task_id not in ['ward_unlock', 'send_slack_notification', 'create_jira_issue', 'check_workflow_status']:
             failed_tasks.append(task_instance.task_id)
     
     if failed_tasks:
@@ -262,7 +439,7 @@ with DAG(
     
     unlock = ward_unlock("{{ params.target }}")
     slack_notify = send_slack_notification()
+    jira_issue = create_jira_issue()
     status_check = check_workflow_status()
 
-    # DAG structure: Always unlock, send Slack notification, then check status
-    lock >> metadata >> nornir >> ansible >> unlock >> slack_notify >> status_check
+    lock >> metadata >> nornir >> ansible >> unlock >> [slack_notify, jira_issue] >> status_check
