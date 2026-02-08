@@ -3,6 +3,7 @@ from airflow import DAG
 from airflow.decorators import task
 from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
 from airflow.exceptions import AirflowFailException
+from airflow.models import State
 from datetime import datetime, timedelta
 import json
 import logging
@@ -17,6 +18,7 @@ VAULT_TOKEN = os.getenv("VAULT_TOKEN")
 REDIS_HOST = "netbox-valkey-primary.core.svc.cluster.local"
 REDIS_PORT = 6379
 REDIS_PASSWORD = os.getenv("VALKEY_PASSWORD")
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 
 
 def acquire_lock(lock_name: str, ttl: int = 300):
@@ -40,7 +42,7 @@ def ward_lock(target: str):
     acquire_lock(f"{target}-lock", ttl=300)
 
 
-@task(trigger_rule="all_done")  # Always run to clean up
+@task(trigger_rule="all_done")
 def ward_unlock(target: str):
     """Always release lock, even on failure"""
     release_lock(f"{target}-lock")
@@ -87,16 +89,79 @@ def get_netbox_metadata(target: str):
     }
 
 
-@task(trigger_rule="all_done")  # Run even on upstream failure to report status
+@task(trigger_rule="all_done")
+def send_slack_notification(**context):
+    """Send Slack notification on task failure"""
+    SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK_URL")
+    
+    if not SLACK_WEBHOOK:
+        logging.error("SLACK_WEBHOOK_URL environment variable not set")
+        return "Slack webhook not configured"
+    
+    dag_run = context["dag_run"]
+    tis = dag_run.get_task_instances()
+    
+    # Find failed tasks (excluding this notification task and status check)
+    failed_tis = [
+        ti for ti in tis
+        if ti.state == State.FAILED
+        and ti.task_id not in {"send_slack_notification", "check_workflow_status"}
+    ]
+    
+    if not failed_tis:
+        logging.info("No failures; skipping Slack notification.")
+        return None
+    
+    # Get first failed task for notification
+    ti = failed_tis[0]
+    
+    # Build kubectl command to view logs
+    log_command = (
+        f"kubectl logs -n airflow airflow-scheduler-0 -c scheduler --tail=200 | "
+        f"grep -A 50 '{ti.task_id}'"
+    )
+    
+    # Create Slack message with kubectl command
+    payload = {
+        "text": f""":x: Airflow Task Failed
+DAG: `{dag_run.dag_id}`
+Run: `{dag_run.run_id}`
+Task: `{ti.task_id}`
+State: `{ti.state}`
+
+View logs with:
+```
+{log_command}
+```
+
+Or view all task states:
+```
+kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- \\
+  airflow tasks states-for-dag-run {dag_run.dag_id} {dag_run.run_id}
+```
+"""
+    }
+    
+    try:
+        resp = requests.post(SLACK_WEBHOOK, json=payload, timeout=10)
+        resp.raise_for_status()
+        logging.info(f"Slack notification sent for failed task: {ti.task_id}")
+        return f"Notified about {ti.task_id} failure"
+    except Exception as e:
+        logging.error(f"Failed to send Slack notification: {e}")
+        # Don't fail the DAG if Slack notification fails
+        return f"Slack notification failed: {e}"
+
+
+@task(trigger_rule="all_done")
 def check_workflow_status(**context):
     """Check if any upstream tasks failed and fail the DAG if so"""
-    ti = context['ti']
     dag_run = context['dag_run']
     
     # Get all task instances for this DAG run
     failed_tasks = []
     for task_instance in dag_run.get_task_instances():
-        if task_instance.state == 'failed' and task_instance.task_id not in ['ward_unlock', 'check_workflow_status']:
+        if task_instance.state == 'failed' and task_instance.task_id not in ['ward_unlock', 'send_slack_notification', 'check_workflow_status']:
             failed_tasks.append(task_instance.task_id)
     
     if failed_tasks:
@@ -196,6 +261,8 @@ with DAG(
     )
     
     unlock = ward_unlock("{{ params.target }}")
+    slack_notify = send_slack_notification()
     status_check = check_workflow_status()
 
-    lock >> metadata >> nornir >> ansible >> unlock >> status_check
+    # DAG structure: Always unlock, send Slack notification, then check status
+    lock >> metadata >> nornir >> ansible >> unlock >> slack_notify >> status_check
