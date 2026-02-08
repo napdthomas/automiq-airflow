@@ -30,8 +30,9 @@ def release_lock(lock_name: str):
     r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD, db=0)
     deleted = r.delete(lock_name)
     if deleted == 0:
-        raise AirflowFailException(f"Failed to release lock {lock_name}")
-    logging.info(f"Lock released for {lock_name}")
+        logging.warning(f"Lock {lock_name} was not held or already released")
+    else:
+        logging.info(f"Lock released for {lock_name}")
 
 
 @task
@@ -39,8 +40,9 @@ def ward_lock(target: str):
     acquire_lock(f"{target}-lock", ttl=300)
 
 
-@task(trigger_rule="all_done")
+@task(trigger_rule="all_done")  # Always run to clean up
 def ward_unlock(target: str):
+    """Always release lock, even on failure"""
     release_lock(f"{target}-lock")
 
 
@@ -85,6 +87,24 @@ def get_netbox_metadata(target: str):
     }
 
 
+@task(trigger_rule="all_done")  # Run even on upstream failure to report status
+def check_workflow_status(**context):
+    """Check if any upstream tasks failed and fail the DAG if so"""
+    ti = context['ti']
+    dag_run = context['dag_run']
+    
+    # Get all task instances for this DAG run
+    failed_tasks = []
+    for task_instance in dag_run.get_task_instances():
+        if task_instance.state == 'failed' and task_instance.task_id not in ['ward_unlock', 'check_workflow_status']:
+            failed_tasks.append(task_instance.task_id)
+    
+    if failed_tasks:
+        raise AirflowFailException(f"Workflow failed due to task failures: {', '.join(failed_tasks)}")
+    
+    logging.info("All workflow tasks completed successfully!")
+
+
 default_args = {
     "owner": "automiq",
     "start_date": datetime(2025, 1, 1),
@@ -107,7 +127,7 @@ with DAG(
     lock = ward_lock("{{ params.target }}")
     metadata = get_netbox_metadata("{{ params.target }}")
     
-    # Create Nornir task - uses XCom to get metadata
+    # Create Nornir task
     nornir = KubernetesPodOperator(
         task_id='run_nornir',
         namespace='ansible',
@@ -136,7 +156,7 @@ with DAG(
         get_logs=True,
     )
     
-    # Create Ansible task - uses XCom to get metadata
+    # Create Ansible task
     ansible = KubernetesPodOperator(
         task_id='run_ansible',
         namespace='ansible',
@@ -176,5 +196,6 @@ with DAG(
     )
     
     unlock = ward_unlock("{{ params.target }}")
+    status_check = check_workflow_status()
 
-    lock >> metadata >> nornir >> ansible >> unlock
+    lock >> metadata >> nornir >> ansible >> unlock >> status_check
