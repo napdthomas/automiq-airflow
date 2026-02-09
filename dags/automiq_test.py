@@ -9,7 +9,7 @@ import logging
 import requests
 import redis
 import os
-import base64
+import time
 
 # Config
 NETBOX_URL = "http://netbox.core.svc.cluster.local/api"
@@ -18,6 +18,9 @@ VAULT_TOKEN = os.getenv("VAULT_TOKEN")
 REDIS_HOST = "netbox-valkey-primary.core.svc.cluster.local"
 REDIS_PORT = 6379
 REDIS_PASSWORD = os.getenv("VALKEY_PASSWORD")
+JENKINS_URL = "http://jenkins.jenkins.svc.cluster.local:8080"
+JENKINS_USER = os.getenv("JENKINS_USER")
+JENKINS_TOKEN = os.getenv("JENKINS_TOKEN")
 
 
 def acquire_lock(lock_name: str, ttl: int = 300):
@@ -34,147 +37,6 @@ def release_lock(lock_name: str):
         logging.warning(f"Lock {lock_name} was not held or already released")
     else:
         logging.info(f"Lock released for {lock_name}")
-
-
-def send_failure_notifications(context):
-    """
-    Callback function triggered on any task failure.
-    Sends notifications to both Slack and Jira.
-    """
-    ti = context['task_instance']
-    dag_run = context['dag_run']
-    exception = context.get('exception')
-    
-    SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK_URL")
-    JIRA_BASE_URL = "https://automiq-automation.atlassian.net"
-    JIRA_PROJECT_KEY = "KAN"
-    JIRA_USER = os.getenv("JIRA_USER")
-    JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
-    
-    # Build kubectl commands for troubleshooting
-    log_command = (
-        f"kubectl logs -n airflow airflow-scheduler-0 -c scheduler --tail=200 | "
-        f"grep -A 50 '{ti.task_id}'"
-    )
-    
-    status_command = (
-        f"kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- "
-        f"airflow tasks states-for-dag-run {dag_run.dag_id} {dag_run.run_id}"
-    )
-    
-    # Send Slack notification
-    if SLACK_WEBHOOK:
-        try:
-            slack_payload = {
-                "text": f""":x: Airflow Task Failed
-DAG: `{dag_run.dag_id}`
-Run: `{dag_run.run_id}`
-Task: `{ti.task_id}`
-State: `{ti.state}`
-Exception: `{str(exception)[:200] if exception else 'N/A'}`
-
-View logs with:
-```
-{log_command}
-```
-
-Or view all task states:
-```
-{status_command}
-```
-"""
-            }
-            
-            resp = requests.post(SLACK_WEBHOOK, json=slack_payload, timeout=10)
-            resp.raise_for_status()
-            print(f"✓ Slack notification sent for failed task: {ti.task_id}")
-        except Exception as e:
-            print(f"✗ Failed to send Slack notification: {e}")
-    else:
-        print("✗ Slack webhook not configured")
-    
-    # Send Jira notification
-    if JIRA_USER and JIRA_API_TOKEN:
-        try:
-            jira_payload = {
-                "fields": {
-                    "project": {"key": JIRA_PROJECT_KEY},
-                    "summary": f":x: Airflow Task Failed - {dag_run.dag_id}:{ti.task_id}",
-                    "description": {
-                        "type": "doc",
-                        "version": 1,
-                        "content": [
-                            {
-                                "type": "paragraph",
-                                "content": [{"type": "text", "text": "Airflow Task Failed\n\n"}]
-                            },
-                            {
-                                "type": "paragraph",
-                                "content": [{"type": "text", "text": f"DAG: {dag_run.dag_id}\n", "marks": [{"type": "strong"}]}]
-                            },
-                            {
-                                "type": "paragraph",
-                                "content": [{"type": "text", "text": f"Run ID: {dag_run.run_id}\n"}]
-                            },
-                            {
-                                "type": "paragraph",
-                                "content": [{"type": "text", "text": f"Failed Task: {ti.task_id}\n"}]
-                            },
-                            {
-                                "type": "paragraph",
-                                "content": [{"type": "text", "text": f"State: {ti.state}\n"}]
-                            },
-                            {
-                                "type": "paragraph",
-                                "content": [{"type": "text", "text": f"Exception: {str(exception)[:500] if exception else 'N/A'}\n"}]
-                            },
-                            {
-                                "type": "paragraph",
-                                "content": [{"type": "text", "text": "\nView logs with:\n"}]
-                            },
-                            {
-                                "type": "codeBlock",
-                                "attrs": {"language": "bash"},
-                                "content": [{"type": "text", "text": log_command}]
-                            },
-                            {
-                                "type": "paragraph",
-                                "content": [{"type": "text", "text": "\nView all task states:\n"}]
-                            },
-                            {
-                                "type": "codeBlock",
-                                "attrs": {"language": "bash"},
-                                "content": [{"type": "text", "text": status_command}]
-                            }
-                        ]
-                    },
-                    "issuetype": {"name": "Task"}
-                }
-            }
-            
-            auth_string = f"{JIRA_USER}:{JIRA_API_TOKEN}"
-            auth_bytes = base64.b64encode(auth_string.encode('ascii'))
-            base64_auth = auth_bytes.decode('ascii')
-            
-            headers = {
-                "Authorization": f"Basic {base64_auth}",
-                "Content-Type": "application/json"
-            }
-            
-            resp = requests.post(
-                f"{JIRA_BASE_URL}/rest/api/3/issue",
-                json=jira_payload,
-                headers=headers,
-                timeout=10
-            )
-            resp.raise_for_status()
-            issue_data = resp.json()
-            issue_key = issue_data.get("key")
-            print(f"✓ Jira issue created: {issue_key} - {JIRA_BASE_URL}/browse/{issue_key}")
-        except Exception as e:
-            print(f"✗ Failed to create Jira issue: {e}")
-    else:
-        print("✗ Jira credentials not configured")
 
 
 @task
@@ -232,23 +94,11 @@ def get_netbox_metadata(target: str):
 @task(trigger_rule="all_done")
 def check_workflow_status(**context):
     """
-    Check if any critical tasks failed and fail the DAG if so.
-    This ensures the DAG shows as 'failed' when tasks fail.
+    Check if any critical tasks failed.
+    Store failure info in XCom for Jenkins notification.
     """
     ti = context['ti']
     dag_run = context['dag_run']
-    
-    # Get the states of critical tasks by checking XCom or task context
-    # Since we can't query the DB in Airflow 3.0, we use a different approach
-    
-    # Check if any upstream tasks failed by examining the current task's upstream
-    # If this task is running, some tasks completed, but we need to know if any failed
-    
-    # Simple approach: Store failed task info in XCom from the callback
-    # Or check task states from the dag_run object (if accessible)
-    
-    # For Airflow 3.0, the best approach is to let the callback handle notifications
-    # and use task dependencies to determine success/failure
     
     # Check if critical workflow tasks succeeded by trying to pull their XCom data
     critical_tasks = ['ward_lock', 'get_netbox_metadata', 'run_nornir', 'run_ansible']
@@ -256,34 +106,117 @@ def check_workflow_status(**context):
     
     for task_id in critical_tasks:
         try:
-            # If the task failed, it won't have pushed successful XCom data
-            # This is a heuristic approach for Airflow 3.0
             result = ti.xcom_pull(task_ids=task_id, key='return_value')
-            # If we got here, task likely succeeded (or was skipped)
+            if result is None and task_id != 'ward_lock':  # ward_lock doesn't return anything
+                failed_tasks.append(task_id)
         except Exception as e:
-            # Task may have failed
             logging.warning(f"Could not retrieve XCom from {task_id}: {e}")
+            failed_tasks.append(task_id)
     
-    # Alternative: Check if the callback was triggered (it would have set a flag)
-    # Or simply assume if we're here with trigger_rule="all_done", check for failures
-    
-    # Since we can't reliably detect failures in Airflow 3.0 without DB access,
-    # we'll rely on the on_failure_callback to handle notifications
-    # and manually check the most likely failure points
-    
-    # If get_netbox_metadata failed, its XCom won't exist
-    try:
-        metadata = ti.xcom_pull(task_ids='get_netbox_metadata', key='return_value')
-        if not metadata:
-            failed_tasks.append('get_netbox_metadata')
-    except:
-        failed_tasks.append('get_netbox_metadata')
-    
+    # Store failure info in XCom for Jenkins task
     if failed_tasks:
+        ti.xcom_push(key='failed_tasks', value=failed_tasks)
+        ti.xcom_push(key='workflow_failed', value=True)
         raise AirflowFailException(f"Workflow failed due to task failures: {', '.join(failed_tasks)}")
     
+    ti.xcom_push(key='workflow_failed', value=False)
     logging.info("All workflow tasks completed successfully!")
     return "Workflow completed successfully"
+
+
+@task(trigger_rule="all_done")
+def trigger_jenkins_slack_notification(**context):
+    """
+    Trigger Jenkins job to send Slack notification if workflow failed.
+    """
+    ti = context['ti']
+    dag_run = context['dag_run']
+    
+    if not JENKINS_USER or not JENKINS_TOKEN:
+        logging.error("Jenkins credentials not configured")
+        return "Jenkins credentials not configured"
+    
+    # Check if workflow failed
+    workflow_failed = ti.xcom_pull(task_ids='check_workflow_status', key='workflow_failed')
+    
+    if not workflow_failed:
+        logging.info("No failures; skipping Slack notification.")
+        return "No failures detected"
+    
+    # Get failed tasks
+    failed_tasks = ti.xcom_pull(task_ids='check_workflow_status', key='failed_tasks') or []
+    failed_task_id = failed_tasks[0] if failed_tasks else "unknown"
+    
+    # Build log command
+    log_command = (
+        f"kubectl logs -n airflow airflow-scheduler-0 -c scheduler --tail=200 | "
+        f"grep -A 50 '{failed_task_id}'"
+    )
+    
+    status_command = (
+        f"kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- "
+        f"airflow tasks states-for-dag-run {dag_run.dag_id} {dag_run.run_id}"
+    )
+    
+    # Jenkins parameters
+    jenkins_params = {
+        "DAG_ID": dag_run.dag_id,
+        "RUN_ID": dag_run.run_id,
+        "TASK_ID": failed_task_id,
+        "LOG_URL": status_command,
+    }
+    
+    try:
+        job_name = "run_slack_job_scm"
+        url = f"{JENKINS_URL}/job/{job_name}/buildWithParameters"
+        
+        logging.info(f"Triggering Jenkins Slack job: {job_name}")
+        logging.info(f"Parameters: {jenkins_params}")
+        
+        resp = requests.post(
+            url,
+            params=jenkins_params,
+            auth=(JENKINS_USER, JENKINS_TOKEN),
+            timeout=10
+        )
+        resp.raise_for_status()
+        
+        # Get queue location
+        queue_url = resp.headers.get("Location")
+        if not queue_url:
+            logging.error("No queue location in Jenkins response")
+            return "Jenkins job triggered but no queue URL"
+        
+        logging.info(f"Jenkins job queued at: {queue_url}")
+        
+        # Wait for job to start and get build number
+        build_number = None
+        for _ in range(30):
+            try:
+                q = requests.get(
+                    f"{queue_url}api/json",
+                    auth=(JENKINS_USER, JENKINS_TOKEN),
+                    timeout=5
+                )
+                q.raise_for_status()
+                data = q.json()
+                if data.get("executable"):
+                    build_number = data["executable"]["number"]
+                    break
+            except Exception as e:
+                logging.warning(f"Waiting for Jenkins build to start: {e}")
+            time.sleep(2)
+        
+        if build_number:
+            logging.info(f"✓ Jenkins Slack notification job started: #{build_number}")
+            return f"Slack notification job started: #{build_number}"
+        else:
+            logging.warning("Jenkins job queued but build number not retrieved")
+            return "Slack notification job queued"
+            
+    except Exception as e:
+        logging.error(f"Failed to trigger Jenkins Slack notification: {e}")
+        return f"Failed to trigger Jenkins: {e}"
 
 
 default_args = {
@@ -298,7 +231,6 @@ with DAG(
     default_args=default_args,
     schedule=None,
     catchup=False,
-    on_failure_callback=send_failure_notifications,  # DAG-level callback for notifications
     params={
         "target": "clab-netauto-lab-juno1",
         "playbook": "junos_system_baseline.yaml",
@@ -379,6 +311,7 @@ with DAG(
     
     unlock = ward_unlock("{{ params.target }}")
     status_check = check_workflow_status()
+    slack_notify = trigger_jenkins_slack_notification()
 
-    # DAG flow: Run workflow, always unlock, then check status
-    lock >> metadata >> nornir >> ansible >> unlock >> status_check
+    # DAG flow: Run workflow, always unlock, check status, send Slack notification via Jenkins
+    lock >> metadata >> nornir >> ansible >> unlock >> status_check >> slack_notify
