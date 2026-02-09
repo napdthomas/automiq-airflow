@@ -36,6 +36,147 @@ def release_lock(lock_name: str):
         logging.info(f"Lock released for {lock_name}")
 
 
+def send_failure_notifications(context):
+    """
+    Callback function triggered on any task failure.
+    Sends notifications to both Slack and Jira.
+    """
+    ti = context['task_instance']
+    dag_run = context['dag_run']
+    exception = context.get('exception')
+    
+    SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK_URL")
+    JIRA_BASE_URL = "https://automiq-automation.atlassian.net"
+    JIRA_PROJECT_KEY = "KAN"
+    JIRA_USER = os.getenv("JIRA_USER")
+    JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
+    
+    # Build kubectl commands for troubleshooting
+    log_command = (
+        f"kubectl logs -n airflow airflow-scheduler-0 -c scheduler --tail=200 | "
+        f"grep -A 50 '{ti.task_id}'"
+    )
+    
+    status_command = (
+        f"kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- "
+        f"airflow tasks states-for-dag-run {dag_run.dag_id} {dag_run.run_id}"
+    )
+    
+    # Send Slack notification
+    if SLACK_WEBHOOK:
+        try:
+            slack_payload = {
+                "text": f""":x: Airflow Task Failed
+DAG: `{dag_run.dag_id}`
+Run: `{dag_run.run_id}`
+Task: `{ti.task_id}`
+State: `{ti.state}`
+Exception: `{str(exception)[:200] if exception else 'N/A'}`
+
+View logs with:
+```
+{log_command}
+```
+
+Or view all task states:
+```
+{status_command}
+```
+"""
+            }
+            
+            resp = requests.post(SLACK_WEBHOOK, json=slack_payload, timeout=10)
+            resp.raise_for_status()
+            print(f"✓ Slack notification sent for failed task: {ti.task_id}")
+        except Exception as e:
+            print(f"✗ Failed to send Slack notification: {e}")
+    else:
+        print("✗ Slack webhook not configured")
+    
+    # Send Jira notification
+    if JIRA_USER and JIRA_API_TOKEN:
+        try:
+            jira_payload = {
+                "fields": {
+                    "project": {"key": JIRA_PROJECT_KEY},
+                    "summary": f":x: Airflow Task Failed - {dag_run.dag_id}:{ti.task_id}",
+                    "description": {
+                        "type": "doc",
+                        "version": 1,
+                        "content": [
+                            {
+                                "type": "paragraph",
+                                "content": [{"type": "text", "text": "Airflow Task Failed\n\n"}]
+                            },
+                            {
+                                "type": "paragraph",
+                                "content": [{"type": "text", "text": f"DAG: {dag_run.dag_id}\n", "marks": [{"type": "strong"}]}]
+                            },
+                            {
+                                "type": "paragraph",
+                                "content": [{"type": "text", "text": f"Run ID: {dag_run.run_id}\n"}]
+                            },
+                            {
+                                "type": "paragraph",
+                                "content": [{"type": "text", "text": f"Failed Task: {ti.task_id}\n"}]
+                            },
+                            {
+                                "type": "paragraph",
+                                "content": [{"type": "text", "text": f"State: {ti.state}\n"}]
+                            },
+                            {
+                                "type": "paragraph",
+                                "content": [{"type": "text", "text": f"Exception: {str(exception)[:500] if exception else 'N/A'}\n"}]
+                            },
+                            {
+                                "type": "paragraph",
+                                "content": [{"type": "text", "text": "\nView logs with:\n"}]
+                            },
+                            {
+                                "type": "codeBlock",
+                                "attrs": {"language": "bash"},
+                                "content": [{"type": "text", "text": log_command}]
+                            },
+                            {
+                                "type": "paragraph",
+                                "content": [{"type": "text", "text": "\nView all task states:\n"}]
+                            },
+                            {
+                                "type": "codeBlock",
+                                "attrs": {"language": "bash"},
+                                "content": [{"type": "text", "text": status_command}]
+                            }
+                        ]
+                    },
+                    "issuetype": {"name": "Task"}
+                }
+            }
+            
+            auth_string = f"{JIRA_USER}:{JIRA_API_TOKEN}"
+            auth_bytes = base64.b64encode(auth_string.encode('ascii'))
+            base64_auth = auth_bytes.decode('ascii')
+            
+            headers = {
+                "Authorization": f"Basic {base64_auth}",
+                "Content-Type": "application/json"
+            }
+            
+            resp = requests.post(
+                f"{JIRA_BASE_URL}/rest/api/3/issue",
+                json=jira_payload,
+                headers=headers,
+                timeout=10
+            )
+            resp.raise_for_status()
+            issue_data = resp.json()
+            issue_key = issue_data.get("key")
+            print(f"✓ Jira issue created: {issue_key} - {JIRA_BASE_URL}/browse/{issue_key}")
+        except Exception as e:
+            print(f"✗ Failed to create Jira issue: {e}")
+    else:
+        print("✗ Jira credentials not configured")
+
+
 @task
 def ward_lock(target: str):
     acquire_lock(f"{target}-lock", ttl=300)
@@ -88,281 +229,12 @@ def get_netbox_metadata(target: str):
     }
 
 
-@task(trigger_rule="all_done")
-def send_slack_notification(**context):
-    """Send Slack notification on task failure"""
-    SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK_URL")
-    
-    if not SLACK_WEBHOOK:
-        logging.error("SLACK_WEBHOOK_URL environment variable not set")
-        return "Slack webhook not configured"
-    
-    dag_run = context["dag_run"]
-    
-    # In Airflow 3.0, use TaskInstance to get task states
-    from airflow.models import TaskInstance
-    from airflow.utils.session import create_session
-    
-    with create_session() as session:
-        tis = session.query(TaskInstance).filter(
-            TaskInstance.dag_id == dag_run.dag_id,
-            TaskInstance.run_id == dag_run.run_id,
-            TaskInstance.state == 'failed',
-            TaskInstance.task_id.notin_(['send_slack_notification', 'create_jira_issue', 'check_workflow_status'])
-        ).all()
-    
-    if not tis:
-        logging.info("No failures; skipping Slack notification.")
-        return None
-    
-    # Get first failed task for notification
-    ti = tis[0]
-    
-    # Build kubectl command to view logs
-    log_command = (
-        f"kubectl logs -n airflow airflow-scheduler-0 -c scheduler --tail=200 | "
-        f"grep -A 50 '{ti.task_id}'"
-    )
-    
-    # Create Slack message with kubectl command
-    payload = {
-        "text": f""":x: Airflow Task Failed
-DAG: `{dag_run.dag_id}`
-Run: `{dag_run.run_id}`
-Task: `{ti.task_id}`
-State: `{ti.state}`
-
-View logs with:
-```
-{log_command}
-```
-
-Or view all task states:
-```
-kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- \\
-  airflow tasks states-for-dag-run {dag_run.dag_id} {dag_run.run_id}
-```
-"""
-    }
-    
-    try:
-        resp = requests.post(SLACK_WEBHOOK, json=payload, timeout=10)
-        resp.raise_for_status()
-        logging.info(f"Slack notification sent for failed task: {ti.task_id}")
-        return f"Notified about {ti.task_id} failure"
-    except Exception as e:
-        logging.error(f"Failed to send Slack notification: {e}")
-        # Don't fail the DAG if Slack notification fails
-        return f"Slack notification failed: {e}"
-
-
-@task(trigger_rule="all_done")
-def create_jira_issue(**context):
-    """Create Jira issue on task failure"""
-    JIRA_BASE_URL = "https://automiq-automation.atlassian.net"
-    JIRA_PROJECT_KEY = "KAN"
-    JIRA_USER = os.getenv("JIRA_USER")
-    JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
-    
-    if not JIRA_USER or not JIRA_API_TOKEN:
-        logging.error("JIRA_USER or JIRA_API_TOKEN environment variable not set")
-        return "Jira credentials not configured"
-    
-    dag_run = context["dag_run"]
-    
-    # In Airflow 3.0, use TaskInstance to get task states
-    from airflow.models import TaskInstance
-    from airflow.utils.session import create_session
-    
-    with create_session() as session:
-        tis = session.query(TaskInstance).filter(
-            TaskInstance.dag_id == dag_run.dag_id,
-            TaskInstance.run_id == dag_run.run_id,
-            TaskInstance.state == 'failed',
-            TaskInstance.task_id.notin_(['send_slack_notification', 'create_jira_issue', 'check_workflow_status'])
-        ).all()
-    
-    if not tis:
-        logging.info("No failures; skipping Jira issue creation.")
-        return None
-    
-    # Get first failed task for Jira issue
-    ti = tis[0]
-    
-    # Build kubectl command to view logs
-    log_command = (
-        f"kubectl logs -n airflow airflow-scheduler-0 -c scheduler --tail=200 | "
-        f"grep -A 50 '{ti.task_id}'"
-    )
-    
-    status_command = (
-        f"kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- "
-        f"airflow tasks states-for-dag-run {dag_run.dag_id} {dag_run.run_id}"
-    )
-    
-    # Create Jira issue payload (API v3 format)
-    payload = {
-        "fields": {
-            "project": {
-                "key": JIRA_PROJECT_KEY
-            },
-            "summary": f":x: Airflow Task Failed - {dag_run.dag_id}:{ti.task_id}",
-            "description": {
-                "type": "doc",
-                "version": 1,
-                "content": [
-                    {
-                        "type": "paragraph",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": "Airflow Task Failed\n\n"
-                            }
-                        ]
-                    },
-                    {
-                        "type": "paragraph",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": f"DAG: {dag_run.dag_id}\n",
-                                "marks": [{"type": "strong"}]
-                            }
-                        ]
-                    },
-                    {
-                        "type": "paragraph",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": f"Run ID: {dag_run.run_id}\n"
-                            }
-                        ]
-                    },
-                    {
-                        "type": "paragraph",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": f"Failed Task: {ti.task_id}\n"
-                            }
-                        ]
-                    },
-                    {
-                        "type": "paragraph",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": f"State: {ti.state}\n"
-                            }
-                        ]
-                    },
-                    {
-                        "type": "paragraph",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": "\nView logs with:\n"
-                            }
-                        ]
-                    },
-                    {
-                        "type": "codeBlock",
-                        "attrs": {"language": "bash"},
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": log_command
-                            }
-                        ]
-                    },
-                    {
-                        "type": "paragraph",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": "\nView all task states:\n"
-                            }
-                        ]
-                    },
-                    {
-                        "type": "codeBlock",
-                        "attrs": {"language": "bash"},
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": status_command
-                            }
-                        ]
-                    }
-                ]
-            },
-            "issuetype": {
-                "name": "Task"
-            }
-        }
-    }
-    
-    # Create Basic Auth header
-    auth_string = f"{JIRA_USER}:{JIRA_API_TOKEN}"
-    auth_bytes = auth_string.encode('ascii')
-    base64_bytes = base64.b64encode(auth_bytes)
-    base64_auth = base64_bytes.decode('ascii')
-    
-    headers = {
-        "Authorization": f"Basic {base64_auth}",
-        "Content-Type": "application/json"
-    }
-    
-    try:
-        resp = requests.post(
-            f"{JIRA_BASE_URL}/rest/api/3/issue",
-            json=payload,
-            headers=headers,
-            timeout=10
-        )
-        resp.raise_for_status()
-        issue_data = resp.json()
-        issue_key = issue_data.get("key")
-        issue_url = f"{JIRA_BASE_URL}/browse/{issue_key}"
-        
-        logging.info(f"Jira issue created: {issue_key} - {issue_url}")
-        return f"Created Jira issue: {issue_key}"
-    except Exception as e:
-        logging.error(f"Failed to create Jira issue: {e}")
-        # Don't fail the DAG if Jira issue creation fails
-        return f"Jira issue creation failed: {e}"
-
-
-@task(trigger_rule="all_done")
-def check_workflow_status(**context):
-    """Check if any upstream tasks failed and fail the DAG if so"""
-    dag_run = context['dag_run']
-    
-    # In Airflow 3.0, use TaskInstance to get task states
-    from airflow.models import TaskInstance
-    from airflow.utils.session import create_session
-    
-    with create_session() as session:
-        failed_tis = session.query(TaskInstance).filter(
-            TaskInstance.dag_id == dag_run.dag_id,
-            TaskInstance.run_id == dag_run.run_id,
-            TaskInstance.state == 'failed',
-            TaskInstance.task_id.notin_(['ward_unlock', 'send_slack_notification', 'create_jira_issue', 'check_workflow_status'])
-        ).all()
-    
-    if failed_tis:
-        failed_task_ids = [ti.task_id for ti in failed_tis]
-        raise AirflowFailException(f"Workflow failed due to task failures: {', '.join(failed_task_ids)}")
-    
-    logging.info("All workflow tasks completed successfully!")
-
-
 default_args = {
     "owner": "automiq",
     "start_date": datetime(2025, 1, 1),
     "retries": 2,
     "retry_delay": timedelta(seconds=20),
+    "on_failure_callback": send_failure_notifications,  # Automatic notifications on ANY task failure
 }
 
 with DAG(
@@ -449,9 +321,6 @@ with DAG(
     )
     
     unlock = ward_unlock("{{ params.target }}")
-    slack_notify = send_slack_notification()
-    jira_issue = create_jira_issue()
-    status_check = check_workflow_status()
 
-    # DAG structure: Always unlock, send notifications in parallel, then check status
-    lock >> metadata >> nornir >> ansible >> unlock >> [slack_notify, jira_issue] >> status_check
+    # Simple linear flow - notifications happen automatically via callback
+    lock >> metadata >> nornir >> ansible >> unlock
