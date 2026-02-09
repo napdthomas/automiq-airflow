@@ -18,9 +18,6 @@ VAULT_TOKEN = os.getenv("VAULT_TOKEN")
 REDIS_HOST = "netbox-valkey-primary.core.svc.cluster.local"
 REDIS_PORT = 6379
 REDIS_PASSWORD = os.getenv("VALKEY_PASSWORD")
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
-JIRA_USER = os.getenv("JIRA_USER")
-JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
 
 
 def acquire_lock(lock_name: str, ttl: int = 300):
@@ -101,21 +98,25 @@ def send_slack_notification(**context):
         return "Slack webhook not configured"
     
     dag_run = context["dag_run"]
-    tis = dag_run.get_task_instances()
     
-    # Find failed tasks (excluding notification and status check tasks)
-    failed_tis = [
-        ti for ti in tis
-        if ti.state == 'failed'
-        and ti.task_id not in {"send_slack_notification", "create_jira_issue", "check_workflow_status"}
-    ]
+    # In Airflow 3.0, use TaskInstance to get task states
+    from airflow.models import TaskInstance
+    from airflow.utils.session import create_session
     
-    if not failed_tis:
+    with create_session() as session:
+        tis = session.query(TaskInstance).filter(
+            TaskInstance.dag_id == dag_run.dag_id,
+            TaskInstance.run_id == dag_run.run_id,
+            TaskInstance.state == 'failed',
+            TaskInstance.task_id.notin_(['send_slack_notification', 'create_jira_issue', 'check_workflow_status'])
+        ).all()
+    
+    if not tis:
         logging.info("No failures; skipping Slack notification.")
         return None
     
     # Get first failed task for notification
-    ti = failed_tis[0]
+    ti = tis[0]
     
     # Build kubectl command to view logs
     log_command = (
@@ -168,21 +169,25 @@ def create_jira_issue(**context):
         return "Jira credentials not configured"
     
     dag_run = context["dag_run"]
-    tis = dag_run.get_task_instances()
     
-    # Find failed tasks (excluding notification and status check tasks)
-    failed_tis = [
-        ti for ti in tis
-        if ti.state == 'failed'
-        and ti.task_id not in {"send_slack_notification", "create_jira_issue", "check_workflow_status"}
-    ]
+    # In Airflow 3.0, use TaskInstance to get task states
+    from airflow.models import TaskInstance
+    from airflow.utils.session import create_session
     
-    if not failed_tis:
+    with create_session() as session:
+        tis = session.query(TaskInstance).filter(
+            TaskInstance.dag_id == dag_run.dag_id,
+            TaskInstance.run_id == dag_run.run_id,
+            TaskInstance.state == 'failed',
+            TaskInstance.task_id.notin_(['send_slack_notification', 'create_jira_issue', 'check_workflow_status'])
+        ).all()
+    
+    if not tis:
         logging.info("No failures; skipping Jira issue creation.")
         return None
     
     # Get first failed task for Jira issue
-    ti = failed_tis[0]
+    ti = tis[0]
     
     # Build kubectl command to view logs
     log_command = (
@@ -334,14 +339,21 @@ def check_workflow_status(**context):
     """Check if any upstream tasks failed and fail the DAG if so"""
     dag_run = context['dag_run']
     
-    # Get all task instances for this DAG run
-    failed_tasks = []
-    for task_instance in dag_run.get_task_instances():
-        if task_instance.state == 'failed' and task_instance.task_id not in ['ward_unlock', 'send_slack_notification', 'create_jira_issue', 'check_workflow_status']:
-            failed_tasks.append(task_instance.task_id)
+    # In Airflow 3.0, use TaskInstance to get task states
+    from airflow.models import TaskInstance
+    from airflow.utils.session import create_session
     
-    if failed_tasks:
-        raise AirflowFailException(f"Workflow failed due to task failures: {', '.join(failed_tasks)}")
+    with create_session() as session:
+        failed_tis = session.query(TaskInstance).filter(
+            TaskInstance.dag_id == dag_run.dag_id,
+            TaskInstance.run_id == dag_run.run_id,
+            TaskInstance.state == 'failed',
+            TaskInstance.task_id.notin_(['ward_unlock', 'send_slack_notification', 'create_jira_issue', 'check_workflow_status'])
+        ).all()
+    
+    if failed_tis:
+        failed_task_ids = [ti.task_id for ti in failed_tis]
+        raise AirflowFailException(f"Workflow failed due to task failures: {', '.join(failed_task_ids)}")
     
     logging.info("All workflow tasks completed successfully!")
 
