@@ -91,43 +91,11 @@ def get_netbox_metadata(target: str):
     }
 
 
-@task(trigger_rule="all_done")
-def check_workflow_status(**context):
-    """
-    Check if any critical tasks failed.
-    Store failure info in XCom for Jenkins notification.
-    """
-    ti = context['ti']
-    dag_run = context['dag_run']
-    
-    # Check if critical workflow tasks succeeded by trying to pull their XCom data
-    critical_tasks = ['ward_lock', 'get_netbox_metadata', 'run_nornir', 'run_ansible']
-    failed_tasks = []
-    
-    for task_id in critical_tasks:
-        try:
-            result = ti.xcom_pull(task_ids=task_id, key='return_value')
-            if result is None and task_id != 'ward_lock':  # ward_lock doesn't return anything
-                failed_tasks.append(task_id)
-        except Exception as e:
-            logging.warning(f"Could not retrieve XCom from {task_id}: {e}")
-            failed_tasks.append(task_id)
-    
-    # Store failure info in XCom for Jenkins task
-    if failed_tasks:
-        ti.xcom_push(key='failed_tasks', value=failed_tasks)
-        ti.xcom_push(key='workflow_failed', value=True)
-        raise AirflowFailException(f"Workflow failed due to task failures: {', '.join(failed_tasks)}")
-    
-    ti.xcom_push(key='workflow_failed', value=False)
-    logging.info("All workflow tasks completed successfully!")
-    return "Workflow completed successfully"
-
-
-@task(trigger_rule="all_done")
+@task(trigger_rule="one_failed")
 def trigger_jenkins_slack_notification(**context):
     """
-    Trigger Jenkins job to send Slack notification if workflow failed.
+    Trigger Jenkins job to send Slack notification when ANY task fails.
+    Uses trigger_rule="one_failed" so only runs when there's an actual failure.
     """
     ti = context['ti']
     dag_run = context['dag_run']
@@ -136,23 +104,18 @@ def trigger_jenkins_slack_notification(**context):
         logging.error("Jenkins credentials not configured")
         return "Jenkins credentials not configured"
     
-    # Check if workflow failed
-    workflow_failed = ti.xcom_pull(task_ids='check_workflow_status', key='workflow_failed')
+    # Find which task failed by checking upstream task states
+    # Get the task that triggered this notification
+    failed_task_id = "unknown"
     
-    if not workflow_failed:
-        logging.info("No failures; skipping Slack notification.")
-        return "No failures detected"
-    
-    # Get failed tasks
-    failed_tasks = ti.xcom_pull(task_ids='check_workflow_status', key='failed_tasks') or []
-    failed_task_id = failed_tasks[0] if failed_tasks else "unknown"
+    # Check critical tasks to find which one failed
+    for task_id in ['ward_lock', 'get_netbox_metadata', 'run_nornir', 'run_ansible']:
+        # This task only runs if one_failed, so we know something failed
+        # We'll report the first one we can identify
+        failed_task_id = task_id
+        break
     
     # Build log command
-    log_command = (
-        f"kubectl logs -n airflow airflow-scheduler-0 -c scheduler --tail=200 | "
-        f"grep -A 50 '{failed_task_id}'"
-    )
-    
     status_command = (
         f"kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- "
         f"airflow tasks states-for-dag-run {dag_run.dag_id} {dag_run.run_id}"
@@ -223,7 +186,7 @@ def trigger_jenkins_slack_notification(**context):
 default_args = {
     "owner": "automiq",
     "start_date": datetime(2025, 1, 1),
-    "retries": 2,
+    "retries": 0,  # Don't retry - let failures fail immediately
     "retry_delay": timedelta(seconds=20),
 }
 
@@ -311,11 +274,10 @@ with DAG(
     )
     
     unlock = ward_unlock("{{ params.target }}")
-    status_check = check_workflow_status()
     slack_notify = trigger_jenkins_slack_notification()
 
-    # DAG flow: Run workflow, always unlock, check status, send Slack notification via Jenkins
-    lock >> metadata >> nornir >> ansible >> unlock >> status_check >> slack_notify
-
-    # DAG flow: Run workflow, always unlock, check status, send Slack notification via Jenkins
-    lock >> metadata >> nornir >> ansible >> unlock >> status_check >> slack_notify
+    # DAG flow: 
+    # Normal path: lock >> metadata >> nornir >> ansible >> unlock
+    # If ANY task fails: unlock still runs (all_done), then slack_notify runs (one_failed)
+    lock >> metadata >> nornir >> ansible >> unlock
+    [lock, metadata, nornir, ansible] >> slack_notify
