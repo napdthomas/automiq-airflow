@@ -18,7 +18,7 @@ VAULT_TOKEN = os.getenv("VAULT_TOKEN")
 REDIS_HOST = "netbox-valkey-primary.core.svc.cluster.local"
 REDIS_PORT = 6379
 REDIS_PASSWORD = os.getenv("VALKEY_PASSWORD")
-JENKINS_URL = "http://jenkins.jenkins.svc.cluster.local:8080"
+JENKINS_URL = "http://jenkins.jenkins:8080"
 JENKINS_USER = os.getenv("JENKINS_USER")
 JENKINS_TOKEN = os.getenv("JENKINS_TOKEN")
 
@@ -167,10 +167,11 @@ def trigger_jenkins_slack_notification(**context):
     }
     
     try:
-        job_name = "run_slack_job_scm"
+        job_name = "run_slack_job"
         url = f"{JENKINS_URL}/job/{job_name}/buildWithParameters"
         
         logging.info(f"Triggering Jenkins Slack job: {job_name}")
+        logging.info(f"Jenkins URL: {url}")
         logging.info(f"Parameters: {jenkins_params}")
         
         resp = requests.post(
@@ -312,6 +313,9 @@ with DAG(
     unlock = ward_unlock("{{ params.target }}")
     status_check = check_workflow_status()
     slack_notify = trigger_jenkins_slack_notification()
+
+    # DAG flow: Run workflow, always unlock, check status, send Slack notification via Jenkins
+    lock >> metadata >> nornir >> ansible >> unlock >> status_check >> slack_notify
 
     # DAG flow: Run workflow, always unlock, check status, send Slack notification via Jenkins
     lock >> metadata >> nornir >> ansible >> unlock >> status_check >> slack_notify
