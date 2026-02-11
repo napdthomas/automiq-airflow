@@ -94,11 +94,6 @@ def trigger_jenkins_slack_notification(**context):
         logging.error("Jenkins credentials not configured")
         return "Jenkins credentials not configured"
     
-    failed_task_id = "unknown"
-    for task_id in ['ward_lock', 'get_netbox_metadata', 'run_nornir', 'run_ansible']:
-        failed_task_id = task_id
-        break
-    
     status_command = (
         f"kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- "
         f"airflow tasks states-for-dag-run {dag_run.dag_id} {dag_run.run_id}"
@@ -107,7 +102,7 @@ def trigger_jenkins_slack_notification(**context):
     jenkins_params = {
         "DAG_ID": dag_run.dag_id,
         "RUN_ID": dag_run.run_id,
-        "TASK_ID": failed_task_id,
+        "TASK_ID": "see_task_states_below",
         "LOG_URL": status_command,
     }
     
@@ -170,11 +165,6 @@ def trigger_jenkins_jira_notification(**context):
         logging.error("Jenkins credentials not configured")
         return "Jenkins credentials not configured"
     
-    failed_task_id = "unknown"
-    for task_id in ['ward_lock', 'get_netbox_metadata', 'run_nornir', 'run_ansible']:
-        failed_task_id = task_id
-        break
-    
     status_command = (
         f"kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- "
         f"airflow tasks states-for-dag-run {dag_run.dag_id} {dag_run.run_id}"
@@ -183,7 +173,7 @@ def trigger_jenkins_jira_notification(**context):
     jenkins_params = {
         "DAG_ID": dag_run.dag_id,
         "RUN_ID": dag_run.run_id,
-        "TASK_ID": failed_task_id,
+        "TASK_ID": "see_task_states_below",
         "LOG_URL": status_command,
     }
     
