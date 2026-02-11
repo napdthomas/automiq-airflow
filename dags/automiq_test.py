@@ -85,14 +85,47 @@ def get_netbox_metadata(target: str):
     }
 
 
+def detect_failed_task(ti, dag_run):
+    """Helper function to detect which task failed"""
+    failed_task_id = "unknown"
+    
+    task = ti.task
+    upstream_task_ids = task.upstream_task_ids
+    
+    for task_id in ['ward_lock', 'get_netbox_metadata', 'run_nornir', 'run_ansible']:
+        if task_id not in upstream_task_ids:
+            continue
+            
+        try:
+            if task_id == 'ward_lock':
+                continue
+            
+            if task_id == 'get_netbox_metadata':
+                result = ti.xcom_pull(task_ids=task_id, key='return_value')
+                if result is None:
+                    failed_task_id = task_id
+                    break
+            
+            if task_id in ['run_nornir', 'run_ansible']:
+                failed_task_id = task_id
+        except Exception as e:
+            logging.warning(f"Checking task {task_id}: {e}")
+            failed_task_id = task_id
+            break
+    
+    return failed_task_id
+
+
 @task(trigger_rule="one_failed")
-def trigger_jenkins_slack_notification(**context):
+def trigger_jenkins_jira_notification(**context):
     ti = context['ti']
     dag_run = context['dag_run']
     
     if not JENKINS_USER or not JENKINS_TOKEN:
         logging.error("Jenkins credentials not configured")
-        return "Jenkins credentials not configured"
+        return {"status": "error", "message": "Jenkins credentials not configured"}
+    
+    failed_task_id = detect_failed_task(ti, dag_run)
     
     status_command = (
         f"kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- "
@@ -102,15 +135,137 @@ def trigger_jenkins_slack_notification(**context):
     jenkins_params = {
         "DAG_ID": dag_run.dag_id,
         "RUN_ID": dag_run.run_id,
-        "TASK_ID": "see_task_states_below",
+        "TASK_ID": failed_task_id,
         "LOG_URL": status_command,
     }
+    
+    try:
+        job_name = "run_jira_job"
+        url = f"{JENKINS_URL}/job/{job_name}/buildWithParameters"
+        
+        logging.info(f"Triggering Jenkins Jira job: {job_name}")
+        logging.info(f"Failed task: {failed_task_id}")
+        
+        resp = requests.post(
+            url,
+            params=jenkins_params,
+            auth=(JENKINS_USER, JENKINS_TOKEN),
+            timeout=10
+        )
+        resp.raise_for_status()
+        
+        queue_url = resp.headers.get("Location")
+        if not queue_url:
+            logging.error("No queue location in Jenkins response")
+            return {"status": "error", "message": "No queue URL"}
+        
+        logging.info(f"Jenkins job queued at: {queue_url}")
+        
+        build_number = None
+        for _ in range(30):
+            try:
+                q = requests.get(
+                    f"{queue_url}api/json",
+                    auth=(JENKINS_USER, JENKINS_TOKEN),
+                    timeout=5
+                )
+                q.raise_for_status()
+                data = q.json()
+                if data.get("executable"):
+                    build_number = data["executable"]["number"]
+                    break
+            except Exception as e:
+                logging.warning(f"Waiting for Jenkins build to start: {e}")
+            time.sleep(2)
+        
+        if not build_number:
+            logging.warning("Jenkins job queued but build number not retrieved")
+            return {"status": "queued", "build_number": None, "jira_ticket": None}
+        
+        logging.info(f"Jenkins Jira job started: #{build_number}")
+        
+        for _ in range(60):
+            try:
+                build_resp = requests.get(
+                    f"{JENKINS_URL}/job/{job_name}/{build_number}/api/json",
+                    auth=(JENKINS_USER, JENKINS_TOKEN),
+                    timeout=5
+                )
+                build_resp.raise_for_status()
+                build_data = build_resp.json()
+                
+                if not build_data.get("building"):
+                    if build_data.get("result") == "SUCCESS":
+                        console_resp = requests.get(
+                            f"{JENKINS_URL}/job/{job_name}/{build_number}/consoleText",
+                            auth=(JENKINS_USER, JENKINS_TOKEN),
+                            timeout=10
+                        )
+                        console_text = console_resp.text
+                        
+                        import re
+                        match = re.search(r'JIRA issue created.*?([A-Z]+-\d+)', console_text)
+                        if match:
+                            jira_ticket = match.group(1)
+                            logging.info(f"✓ Jira ticket created: {jira_ticket}")
+                            return {"status": "success", "build_number": build_number, "jira_ticket": jira_ticket}
+                        else:
+                            logging.warning("Could not extract Jira ticket from console")
+                            return {"status": "success", "build_number": build_number, "jira_ticket": None}
+                    else:
+                        logging.error(f"Jenkins job failed: {build_data.get('result')}")
+                        return {"status": "failed", "build_number": build_number, "jira_ticket": None}
+                    break
+            except Exception as e:
+                logging.warning(f"Waiting for Jenkins job to complete: {e}")
+            time.sleep(2)
+        
+        return {"status": "timeout", "build_number": build_number, "jira_ticket": None}
+            
+    except Exception as e:
+        logging.error(f"Failed to trigger Jenkins Jira notification: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+@task(trigger_rule="one_failed")
+def trigger_jenkins_slack_notification(**context):
+    ti = context['ti']
+    dag_run = context['dag_run']
+    
+    if not JENKINS_USER or not JENKINS_TOKEN:
+        logging.error("Jenkins credentials not configured")
+        return "Jenkins credentials not configured"
+    
+    failed_task_id = detect_failed_task(ti, dag_run)
+    
+    jira_result = ti.xcom_pull(task_ids='trigger_jenkins_jira_notification', key='return_value')
+    jira_ticket = None
+    if jira_result and isinstance(jira_result, dict):
+        jira_ticket = jira_result.get('jira_ticket')
+    
+    status_command = (
+        f"kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- "
+        f"airflow tasks states-for-dag-run {dag_run.dag_id} {dag_run.run_id}"
+    )
+    
+    jenkins_params = {
+        "DAG_ID": dag_run.dag_id,
+        "RUN_ID": dag_run.run_id,
+        "TASK_ID": failed_task_id,
+        "LOG_URL": status_command,
+    }
+    
+    if jira_ticket:
+        jenkins_params["JIRA_TICKET"] = jira_ticket
     
     try:
         job_name = "run_slack_job"
         url = f"{JENKINS_URL}/job/{job_name}/buildWithParameters"
         
         logging.info(f"Triggering Jenkins Slack job: {job_name}")
+        logging.info(f"Failed task: {failed_task_id}")
+        if jira_ticket:
+            logging.info(f"Jira ticket: {jira_ticket}")
         
         resp = requests.post(
             url,
@@ -153,77 +308,6 @@ def trigger_jenkins_slack_notification(**context):
             
     except Exception as e:
         logging.error(f"Failed to trigger Jenkins Slack notification: {e}")
-        return f"Failed to trigger Jenkins: {e}"
-
-
-@task(trigger_rule="one_failed")
-def trigger_jenkins_jira_notification(**context):
-    ti = context['ti']
-    dag_run = context['dag_run']
-    
-    if not JENKINS_USER or not JENKINS_TOKEN:
-        logging.error("Jenkins credentials not configured")
-        return "Jenkins credentials not configured"
-    
-    status_command = (
-        f"kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- "
-        f"airflow tasks states-for-dag-run {dag_run.dag_id} {dag_run.run_id}"
-    )
-    
-    jenkins_params = {
-        "DAG_ID": dag_run.dag_id,
-        "RUN_ID": dag_run.run_id,
-        "TASK_ID": "see_task_states_below",
-        "LOG_URL": status_command,
-    }
-    
-    try:
-        job_name = "run_jira_job"
-        url = f"{JENKINS_URL}/job/{job_name}/buildWithParameters"
-        
-        logging.info(f"Triggering Jenkins Jira job: {job_name}")
-        
-        resp = requests.post(
-            url,
-            params=jenkins_params,
-            auth=(JENKINS_USER, JENKINS_TOKEN),
-            timeout=10
-        )
-        resp.raise_for_status()
-        
-        queue_url = resp.headers.get("Location")
-        if not queue_url:
-            logging.error("No queue location in Jenkins response")
-            return "Jenkins job triggered but no queue URL"
-        
-        logging.info(f"Jenkins job queued at: {queue_url}")
-        
-        build_number = None
-        for _ in range(30):
-            try:
-                q = requests.get(
-                    f"{queue_url}api/json",
-                    auth=(JENKINS_USER, JENKINS_TOKEN),
-                    timeout=5
-                )
-                q.raise_for_status()
-                data = q.json()
-                if data.get("executable"):
-                    build_number = data["executable"]["number"]
-                    break
-            except Exception as e:
-                logging.warning(f"Waiting for Jenkins build to start: {e}")
-            time.sleep(2)
-        
-        if build_number:
-            logging.info(f"✓ Jenkins Jira notification job started: #{build_number}")
-            return f"Jira notification job started: #{build_number}"
-        else:
-            logging.warning("Jenkins job queued but build number not retrieved")
-            return "Jira notification job queued"
-            
-    except Exception as e:
-        logging.error(f"Failed to trigger Jenkins Jira notification: {e}")
         return f"Failed to trigger Jenkins: {e}"
 
 
@@ -334,14 +418,13 @@ with DAG(
     )
     
     unlock = ward_unlock("{{ params.target }}")
-    slack_notify = trigger_jenkins_slack_notification()
     jira_notify = trigger_jenkins_jira_notification()
+    slack_notify = trigger_jenkins_slack_notification()
     final_check = ensure_dag_fails_on_error()
 
     lock >> metadata >> nornir >> ansible
     
     [nornir, ansible] >> unlock
-    [nornir, ansible] >> slack_notify
-    [nornir, ansible] >> jira_notify
+    [nornir, ansible] >> jira_notify >> slack_notify
     
-    [unlock, slack_notify, jira_notify] >> final_check
+    [unlock, slack_notify] >> final_check
