@@ -304,7 +304,7 @@ with DAG(
         arguments=['''
             set -euo pipefail
             mkdir -p /workspace && cd /workspace
-            git clone https://github.com/napdthomas/automiq-nornir.git repo
+            git clone http://gitea-http.gitea.svc.cluster.local:3000/admin/automiq-nornir.git repo
             cd repo
             echo "Target: $TARGET_NAME ($TARGET_IP)"
             python scripts/nornir_ping.py --target $TARGET_NAME
@@ -327,7 +327,7 @@ with DAG(
             set -euo pipefail
             echo '{{ params.extra_vars }}' > /tmp/extra_vars.json
             mkdir -p /workspace && cd /workspace
-            git clone https://github.com/napdthomas/automiq-ansible.git repo
+            git clone http://gitea-http.gitea.svc.cluster.local:3000/admin/automiq-ansible.git repo
             cd repo
             if [ ! -f "playbooks/{{ params.playbook }}" ]; then
               echo "Playbook not found" >&2
