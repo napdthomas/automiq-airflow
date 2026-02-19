@@ -89,17 +89,24 @@ def publish_completion_event(**context):
     dag_run = context['dag_run']
     ti = context['ti']
     
-    # Check if any critical tasks failed
+    # Check if any critical tasks failed using database query
+    from airflow.models import TaskInstance as TI
+    from airflow.settings import Session
+    
+    session = Session()
     failed_tasks = []
-    for task_id in ['ward_lock', 'get_netbox_metadata', 'run_nornir', 'run_ansible']:
-        task_state = ti.xcom_pull(task_ids=task_id, key='return_value', default=None)
-        # Check actual task state from context
-        try:
-            upstream_ti = context['task_instance'].get_dagrun().get_task_instance(task_id)
-            if upstream_ti and upstream_ti.state == 'failed':
-                failed_tasks.append(task_id)
-        except:
-            pass
+    
+    try:
+        task_instances = session.query(TI).filter(
+            TI.dag_id == dag_run.dag_id,
+            TI.run_id == dag_run.run_id,
+            TI.task_id.in_(['ward_lock', 'get_netbox_metadata', 'run_nornir', 'run_ansible'])
+        ).all()
+        
+        failed_tasks = [t.task_id for t in task_instances if t.state == 'failed']
+        logging.info(f"Task states check: {[(t.task_id, t.state) for t in task_instances]}")
+    finally:
+        session.close()
     
     has_failures = len(failed_tasks) > 0
     
@@ -139,6 +146,7 @@ def fail_if_upstream_failed(**context):
     publish_result = ti.xcom_pull(task_ids='publish_completion_event')
     
     if publish_result and publish_result.get('has_failures'):
+        logging.error(f"DAG failed - automation tasks failed")
         raise AirflowFailException("DAG failed - one or more automation tasks failed")
     
     logging.info("✓ All automation tasks completed successfully")
