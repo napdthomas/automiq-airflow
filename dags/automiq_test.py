@@ -1,4 +1,4 @@
-# dags/automiq_test.py - Without locking
+# dags/automiq_test.py
 from airflow import DAG
 from airflow.decorators import task
 from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
@@ -6,6 +6,7 @@ from airflow.exceptions import AirflowFailException
 from datetime import datetime, timedelta
 import logging
 import requests
+import redis
 import os
 from kafka import KafkaProducer
 import json
@@ -13,7 +14,36 @@ import json
 NETBOX_URL = "http://netbox.core.svc.cluster.local/api"
 VAULT_ADDR = "http://vault.core.svc.cluster.local:8200"
 VAULT_TOKEN = os.getenv("VAULT_TOKEN")
+REDIS_HOST = "netbox-valkey-primary.core.svc.cluster.local"
+REDIS_PORT = 6379
+REDIS_PASSWORD = os.getenv("VALKEY_PASSWORD")
 KAFKA_BOOTSTRAP = "automiq-kafka-bootstrap.kafka.svc.cluster.local:9092"
+
+
+def acquire_lock(lock_name: str, ttl: int = 300):
+    r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD, db=0)
+    if not r.set(lock_name, "locked", nx=True, ex=ttl):
+        raise AirflowFailException(f"Lock already held for {lock_name}")
+    logging.info(f"Lock acquired for {lock_name}")
+
+
+def release_lock(lock_name: str):
+    r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD, db=0)
+    deleted = r.delete(lock_name)
+    if deleted == 0:
+        logging.warning(f"Lock {lock_name} was not held or already released")
+    else:
+        logging.info(f"Lock released for {lock_name}")
+
+
+@task
+def ward_lock(target: str):
+    acquire_lock(f"{target}-lock", ttl=300)
+
+
+@task(trigger_rule="all_done")
+def ward_unlock(target: str):
+    release_lock(f"{target}-lock")
 
 
 @task
@@ -56,18 +86,26 @@ def get_netbox_metadata(target: str):
 @task(trigger_rule="all_done")
 def publish_completion_event(**context):
     """Publish DAG completion event to Kafka for AI agent to process"""
-    dag_run = context['dag_run']
-    ti = context['ti']
+    from airflow.utils.state import DagRunState
     
-    # Simple state determination
-    failed = any(t.state == 'failed' for t in ti.get_dagrun().get_task_instances())
+    dag_run = context['dag_run']
+    
+    # Use get_state() method for Airflow 3.x
+    try:
+        dag_state = dag_run.get_state()
+    except AttributeError:
+        # Fallback if get_state() doesn't exist
+        dag_state = DagRunState.FAILED if any(
+            ti.state == 'failed' for ti in context['ti'].get_dagrun().get_task_instances()
+        ) else DagRunState.SUCCESS
     
     event = {
         "dag_id": dag_run.dag_id,
         "run_id": dag_run.run_id,
-        "state": "failed" if failed else "success",
+        "state": str(dag_state),
         "start_date": str(dag_run.start_date) if dag_run.start_date else None,
-        "end_date": str(datetime.utcnow()),
+        "end_date": str(dag_run.end_date) if dag_run.end_date else None,
+        "duration_seconds": (dag_run.end_date - dag_run.start_date).total_seconds() if (dag_run.end_date and dag_run.start_date) else None,
         "target": dag_run.conf.get("target") if dag_run.conf else None,
         "playbook": dag_run.conf.get("playbook") if dag_run.conf else None,
     }
@@ -79,11 +117,14 @@ def publish_completion_event(**context):
         )
         future = producer.send('airflow.dag.completed', event)
         result = future.get(timeout=10)
+        producer.flush()
         producer.close()
-        logging.info(f"✓ Published to Kafka: partition={result.partition}, offset={result.offset}")
-        return {"status": "success"}
+        logging.info(f"✓ Published to Kafka topic airflow.dag.completed: {event}")
+        logging.info(f"✓ Kafka response: partition={result.partition}, offset={result.offset}")
+        return {"status": "success", "event": event}
     except Exception as e:
-        logging.error(f"✗ Kafka publish failed: {e}")
+        logging.error(f"✗ Failed to publish to Kafka: {type(e).__name__}: {e}")
+        # Don't raise - we want the DAG to complete even if Kafka fails
         return {"status": "failed", "error": str(e)}
 
 
@@ -91,6 +132,7 @@ default_args = {
     "owner": "automiq",
     "start_date": datetime(2025, 1, 1),
     "retries": 0,
+    "retry_delay": timedelta(seconds=20),
 }
 
 with DAG(
@@ -105,6 +147,7 @@ with DAG(
     },
 ) as dag:
 
+    lock = ward_lock("{{ params.target }}")
     metadata = get_netbox_metadata("{{ params.target }}")
 
     nornir = KubernetesPodOperator(
@@ -117,6 +160,7 @@ with DAG(
             mkdir -p /workspace && cd /workspace
             git clone http://gitea-http.gitea.svc.cluster.local:3000/admin/automiq-nornir.git repo
             cd repo
+            echo "Target: $TARGET_NAME ($TARGET_IP)"
             python scripts/nornir_ping.py --target $TARGET_NAME
         '''],
         name='nornir-{{ ti.xcom_pull(task_ids="get_netbox_metadata")["target"] | replace(".", "-") | replace("_", "-") }}',
@@ -135,10 +179,19 @@ with DAG(
         cmds=['/bin/bash', '-c'],
         arguments=['''
             set -euo pipefail
+            echo '{{ params.extra_vars }}' > /tmp/extra_vars.json
             mkdir -p /workspace && cd /workspace
             git clone http://gitea-http.gitea.svc.cluster.local:3000/admin/automiq-ansible.git repo
             cd repo
-            ansible-playbook playbooks/{{ params.playbook }} -i "$TARGET_IP,"
+            if [ ! -f "playbooks/{{ params.playbook }}" ]; then
+              echo "Playbook not found" >&2
+              exit 10
+            fi
+            echo "Running playbook: {{ params.playbook }}"
+            echo "Target: $TARGET_IP"
+            ansible-playbook playbooks/{{ params.playbook }} \
+              -i "$TARGET_IP," \
+              --extra-vars @/tmp/extra_vars.json
         '''],
         name='ansible-{{ ti.xcom_pull(task_ids="get_netbox_metadata")["target"] | replace(".", "-") | replace("_", "-") }}',
         env_vars={
@@ -152,6 +205,7 @@ with DAG(
         get_logs=True,
     )
 
+    unlock = ward_unlock("{{ params.target }}")
     notify = publish_completion_event()
 
-    metadata >> nornir >> ansible >> notify
+    lock >> metadata >> nornir >> ansible >> unlock >> notify
