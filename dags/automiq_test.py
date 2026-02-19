@@ -8,6 +8,8 @@ import logging
 import requests
 import redis
 import os
+from kafka import KafkaProducer
+import json
 
 NETBOX_URL = "http://netbox.core.svc.cluster.local/api"
 VAULT_ADDR = "http://vault.core.svc.cluster.local:8200"
@@ -15,6 +17,7 @@ VAULT_TOKEN = os.getenv("VAULT_TOKEN")
 REDIS_HOST = "netbox-valkey-primary.core.svc.cluster.local"
 REDIS_PORT = 6379
 REDIS_PASSWORD = os.getenv("VALKEY_PASSWORD")
+KAFKA_BOOTSTRAP = "automiq-kafka-bootstrap.kafka.svc.cluster.local:9092"
 
 
 def acquire_lock(lock_name: str, ttl: int = 300):
@@ -78,6 +81,41 @@ def get_netbox_metadata(target: str):
         "manufacturer": device.get("device_type", {}).get("manufacturer", {}).get("name", ""),
         "type": device.get("device_type", {}).get("model", ""),
     }
+
+
+@task(trigger_rule="all_done")
+def publish_completion_event(**context):
+    """Publish DAG completion event to Kafka for AI agent to process"""
+    dag_run = context['dag_run']
+    ti = context['ti']
+    
+    # Determine overall status
+    task_instances = dag_run.get_task_instances()
+    failed_tasks = [t.task_id for t in task_instances if t.state == 'failed']
+    
+    event = {
+        "dag_id": dag_run.dag_id,
+        "run_id": dag_run.run_id,
+        "state": dag_run.state,
+        "start_date": str(dag_run.start_date),
+        "end_date": str(dag_run.end_date),
+        "duration_seconds": (dag_run.end_date - dag_run.start_date).total_seconds() if dag_run.end_date else None,
+        "failed_tasks": failed_tasks,
+        "target": dag_run.conf.get("target") if dag_run.conf else None,
+        "playbook": dag_run.conf.get("playbook") if dag_run.conf else None,
+    }
+    
+    try:
+        producer = KafkaProducer(
+            bootstrap_servers=KAFKA_BOOTSTRAP,
+            value_serializer=lambda v: json.dumps(v).encode('utf-8')
+        )
+        producer.send('airflow.dag.completed', event)
+        producer.flush()
+        producer.close()
+        logging.info(f"Published completion event to Kafka: {event}")
+    except Exception as e:
+        logging.error(f"Failed to publish to Kafka: {e}")
 
 
 default_args = {
@@ -158,5 +196,6 @@ with DAG(
     )
 
     unlock = ward_unlock("{{ params.target }}")
+    notify = publish_completion_event()
 
-    lock >> metadata >> nornir >> ansible >> unlock
+    lock >> metadata >> nornir >> ansible >> unlock >> notify
