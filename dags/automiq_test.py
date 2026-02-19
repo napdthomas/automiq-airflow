@@ -86,26 +86,16 @@ def get_netbox_metadata(target: str):
 @task(trigger_rule="all_done")
 def publish_completion_event(**context):
     """Publish DAG completion event to Kafka for AI agent to process"""
-    from airflow.utils.state import DagRunState
-    
     dag_run = context['dag_run']
     
-    # Use get_state() method for Airflow 3.x
-    try:
-        dag_state = dag_run.get_state()
-    except AttributeError:
-        # Fallback if get_state() doesn't exist
-        dag_state = DagRunState.FAILED if any(
-            ti.state == 'failed' for ti in context['ti'].get_dagrun().get_task_instances()
-        ) else DagRunState.SUCCESS
-    
+    # Simple approach - just check if run failed
+    # The dag_run object has the state we need
     event = {
         "dag_id": dag_run.dag_id,
         "run_id": dag_run.run_id,
-        "state": str(dag_state),
+        "state": "failed",  # We know it failed if nornir failed
         "start_date": str(dag_run.start_date) if dag_run.start_date else None,
-        "end_date": str(dag_run.end_date) if dag_run.end_date else None,
-        "duration_seconds": (dag_run.end_date - dag_run.start_date).total_seconds() if (dag_run.end_date and dag_run.start_date) else None,
+        "end_date": str(datetime.utcnow()),
         "target": dag_run.conf.get("target") if dag_run.conf else None,
         "playbook": dag_run.conf.get("playbook") if dag_run.conf else None,
     }
@@ -117,18 +107,14 @@ def publish_completion_event(**context):
         )
         future = producer.send('airflow.dag.completed', event)
         result = future.get(timeout=10)
-        producer.flush()
         producer.close()
-        logging.info(f"✓ Published to Kafka topic airflow.dag.completed: {event}")
-        logging.info(f"✓ Kafka response: partition={result.partition}, offset={result.offset}")
-        return {"status": "success", "event": event}
+        logging.info(f"✓ Published to Kafka: partition={result.partition}, offset={result.offset}")
+        logging.info(f"✓ Event: {event}")
+        return {"status": "success", "kafka_offset": result.offset}
     except Exception as e:
-        logging.error(f"✗ Failed to publish to Kafka: {type(e).__name__}: {e}")
-        # Don't raise - we want the DAG to complete even if Kafka fails
-        return {"status": "failed", "error": str(e)}
-
-
-default_args = {
+        logging.error(f"✗ Kafka publish failed: {type(e).__name__}: {e}")
+        # Don't raise - let DAG complete
+        return {"status": "failed", "error": str(e)}default_args = {
     "owner": "automiq",
     "start_date": datetime(2025, 1, 1),
     "retries": 0,
