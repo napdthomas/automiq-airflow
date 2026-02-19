@@ -86,15 +86,23 @@ def get_netbox_metadata(target: str):
 @task(trigger_rule="all_done")
 def publish_completion_event(**context):
     """Publish DAG completion event to Kafka for AI agent to process"""
-    from airflow.models import DagRun
+    from airflow.utils.state import DagRunState
     
     dag_run = context['dag_run']
     
-    # Simple approach - just get state from dag_run
+    # Use get_state() method for Airflow 3.x
+    try:
+        dag_state = dag_run.get_state()
+    except AttributeError:
+        # Fallback if get_state() doesn't exist
+        dag_state = DagRunState.FAILED if any(
+            ti.state == 'failed' for ti in context['ti'].get_dagrun().get_task_instances()
+        ) else DagRunState.SUCCESS
+    
     event = {
         "dag_id": dag_run.dag_id,
         "run_id": dag_run.run_id,
-        "state": str(dag_run.state),
+        "state": str(dag_state),
         "start_date": str(dag_run.start_date) if dag_run.start_date else None,
         "end_date": str(dag_run.end_date) if dag_run.end_date else None,
         "duration_seconds": (dag_run.end_date - dag_run.start_date).total_seconds() if (dag_run.end_date and dag_run.start_date) else None,
@@ -107,14 +115,17 @@ def publish_completion_event(**context):
             bootstrap_servers=KAFKA_BOOTSTRAP,
             value_serializer=lambda v: json.dumps(v).encode('utf-8')
         )
-        producer.send('airflow.dag.completed', event)
+        future = producer.send('airflow.dag.completed', event)
+        result = future.get(timeout=10)
         producer.flush()
         producer.close()
-        logging.info(f"✓ Published completion event to Kafka: {event}")
-        return event
+        logging.info(f"✓ Published to Kafka topic airflow.dag.completed: {event}")
+        logging.info(f"✓ Kafka response: partition={result.partition}, offset={result.offset}")
+        return {"status": "success", "event": event}
     except Exception as e:
-        logging.error(f"✗ Failed to publish to Kafka: {e}")
-        raise
+        logging.error(f"✗ Failed to publish to Kafka: {type(e).__name__}: {e}")
+        # Don't raise - we want the DAG to complete even if Kafka fails
+        return {"status": "failed", "error": str(e)}
 
 
 default_args = {
