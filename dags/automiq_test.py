@@ -86,21 +86,18 @@ def get_netbox_metadata(target: str):
 @task(trigger_rule="all_done")
 def publish_completion_event(**context):
     """Publish DAG completion event to Kafka for AI agent to process"""
+    from airflow.models import DagRun
+    
     dag_run = context['dag_run']
-    ti = context['ti']
     
-    # Determine overall status
-    task_instances = dag_run.get_task_instances()
-    failed_tasks = [t.task_id for t in task_instances if t.state == 'failed']
-    
+    # Simple approach - just get state from dag_run
     event = {
         "dag_id": dag_run.dag_id,
         "run_id": dag_run.run_id,
-        "state": dag_run.state,
-        "start_date": str(dag_run.start_date),
-        "end_date": str(dag_run.end_date),
-        "duration_seconds": (dag_run.end_date - dag_run.start_date).total_seconds() if dag_run.end_date else None,
-        "failed_tasks": failed_tasks,
+        "state": str(dag_run.state),
+        "start_date": str(dag_run.start_date) if dag_run.start_date else None,
+        "end_date": str(dag_run.end_date) if dag_run.end_date else None,
+        "duration_seconds": (dag_run.end_date - dag_run.start_date).total_seconds() if (dag_run.end_date and dag_run.start_date) else None,
         "target": dag_run.conf.get("target") if dag_run.conf else None,
         "playbook": dag_run.conf.get("playbook") if dag_run.conf else None,
     }
@@ -113,9 +110,11 @@ def publish_completion_event(**context):
         producer.send('airflow.dag.completed', event)
         producer.flush()
         producer.close()
-        logging.info(f"Published completion event to Kafka: {event}")
+        logging.info(f"✓ Published completion event to Kafka: {event}")
+        return event
     except Exception as e:
-        logging.error(f"Failed to publish to Kafka: {e}")
+        logging.error(f"✗ Failed to publish to Kafka: {e}")
+        raise
 
 
 default_args = {
