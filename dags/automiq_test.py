@@ -86,15 +86,15 @@ def get_netbox_metadata(target: str):
 @task(trigger_rule="all_done")
 def publish_completion_event(**context):
     """Publish DAG completion event to Kafka for AI agent to process"""
-    dag_run = context['dag_run']
-    ti = context['ti']
-    
-    # Check if any critical tasks failed using database query
     from airflow.models import TaskInstance as TI
     from airflow.settings import Session
     
+    dag_run = context['dag_run']
+    
+    # Query database for task states
     session = Session()
     failed_tasks = []
+    has_failures = False
     
     try:
         task_instances = session.query(TI).filter(
@@ -103,12 +103,13 @@ def publish_completion_event(**context):
             TI.task_id.in_(['ward_lock', 'get_netbox_metadata', 'run_nornir', 'run_ansible'])
         ).all()
         
-        failed_tasks = [t.task_id for t in task_instances if t.state == 'failed']
-        logging.info(f"Task states check: {[(t.task_id, t.state) for t in task_instances]}")
+        failed_tasks = [ti.task_id for ti in task_instances if ti.state == 'failed']
+        has_failures = len(failed_tasks) > 0
+        
+        logging.info(f"Detected task states: {[(ti.task_id, ti.state) for ti in task_instances]}")
+        logging.info(f"Failed tasks: {failed_tasks}")
     finally:
         session.close()
-    
-    has_failures = len(failed_tasks) > 0
     
     event = {
         "dag_id": dag_run.dag_id,
@@ -121,6 +122,7 @@ def publish_completion_event(**context):
         "playbook": dag_run.conf.get("playbook") if dag_run.conf else None,
     }
     
+    # Publish to Kafka first
     try:
         producer = KafkaProducer(
             bootstrap_servers=KAFKA_BOOTSTRAP,
@@ -130,26 +132,18 @@ def publish_completion_event(**context):
         result = future.get(timeout=10)
         producer.close()
         logging.info(f"✓ Published to Kafka: partition={result.partition}, offset={result.offset}")
-        logging.info(f"✓ Event: {event}")
-        return {"status": "success", "has_failures": has_failures}
     except Exception as e:
         logging.error(f"✗ Kafka publish failed: {type(e).__name__}: {e}")
-        return {"status": "failed", "error": str(e), "has_failures": has_failures}
-
-
-@task(trigger_rule="all_done")
-def fail_if_upstream_failed(**context):
-    """Final task to ensure DAG fails if any automation tasks failed"""
-    ti = context['ti']
+        # Still raise if we had failures
+        if has_failures:
+            raise AirflowFailException(f"DAG failed - tasks failed: {', '.join(failed_tasks)}")
+        raise
     
-    # Get result from publish task
-    publish_result = ti.xcom_pull(task_ids='publish_completion_event')
+    # After successful publish, raise exception if there were failures
+    # This marks the DAG as failed
+    if has_failures:
+        raise AirflowFailException(f"DAG failed - automation tasks failed: {', '.join(failed_tasks)}")
     
-    if publish_result and publish_result.get('has_failures'):
-        logging.error(f"DAG failed - automation tasks failed")
-        raise AirflowFailException("DAG failed - one or more automation tasks failed")
-    
-    logging.info("✓ All automation tasks completed successfully")
     return "success"
 
 
@@ -232,6 +226,5 @@ with DAG(
 
     unlock = ward_unlock("{{ params.target }}")
     notify = publish_completion_event()
-    final = fail_if_upstream_failed()
 
-    lock >> metadata >> nornir >> ansible >> unlock >> notify >> final
+    lock >> metadata >> nornir >> ansible >> unlock >> notify
