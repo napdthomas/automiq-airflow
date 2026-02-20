@@ -84,45 +84,46 @@ def get_netbox_metadata(target: str):
 
 
 @task(trigger_rule="all_done")
-def publish_completion_event(**context):
-    """Publish DAG completion event to Kafka for AI agent to process"""
-    from airflow.models import TaskInstance as TI
-    from airflow.settings import Session
-    
+def publish_to_kafka(ward_lock_result, metadata_result, nornir_result, ansible_result, **context):
+    """
+    Publish DAG completion to Kafka.
+    Check upstream task results passed as parameters.
+    """
     dag_run = context['dag_run']
+    ti = context['ti']
     
-    # Query database for task states
-    session = Session()
-    failed_tasks = []
+    # Determine state by checking if critical tasks succeeded
+    # If any upstream task failed, entire run failed
+    critical_tasks = ['ward_lock', 'get_netbox_metadata', 'run_nornir', 'run_ansible']
     has_failures = False
     
-    try:
-        task_instances = session.query(TI).filter(
-            TI.dag_id == dag_run.dag_id,
-            TI.run_id == dag_run.run_id,
-            TI.task_id.in_(['ward_lock', 'get_netbox_metadata', 'run_nornir', 'run_ansible'])
-        ).all()
-        
-        failed_tasks = [ti.task_id for ti in task_instances if ti.state == 'failed']
-        has_failures = len(failed_tasks) > 0
-        
-        logging.info(f"Detected task states: {[(ti.task_id, ti.state) for ti in task_instances]}")
-        logging.info(f"Failed tasks: {failed_tasks}")
-    finally:
-        session.close()
+    for task_id in critical_tasks:
+        task_state = ti.xcom_pull(task_ids=task_id, key='state', default=None)
+        if task_state == 'failed':
+            has_failures = True
+            break
+    
+    # If we can't determine from xcom, check task instance states
+    if not has_failures:
+        for task_id in critical_tasks:
+            try:
+                upstream_ti = dag_run.get_task_instance(task_id)
+                if upstream_ti and upstream_ti.state == 'failed':
+                    has_failures = True
+                    break
+            except:
+                pass
     
     event = {
         "dag_id": dag_run.dag_id,
         "run_id": dag_run.run_id,
         "state": "failed" if has_failures else "success",
-        "failed_tasks": failed_tasks,
         "start_date": str(dag_run.start_date) if dag_run.start_date else None,
         "end_date": str(datetime.utcnow()),
         "target": dag_run.conf.get("target") if dag_run.conf else None,
         "playbook": dag_run.conf.get("playbook") if dag_run.conf else None,
     }
     
-    # Publish to Kafka first
     try:
         producer = KafkaProducer(
             bootstrap_servers=KAFKA_BOOTSTRAP,
@@ -131,27 +132,17 @@ def publish_completion_event(**context):
         future = producer.send('airflow.dag.completed', event)
         result = future.get(timeout=10)
         producer.close()
-        logging.info(f"✓ Published to Kafka: partition={result.partition}, offset={result.offset}")
+        logging.info(f"✓ Published to Kafka: {event}")
+        return {"status": "published", "state": event["state"]}
     except Exception as e:
-        logging.error(f"✗ Kafka publish failed: {type(e).__name__}: {e}")
-        # Still raise if we had failures
-        if has_failures:
-            raise AirflowFailException(f"DAG failed - tasks failed: {', '.join(failed_tasks)}")
-        raise
-    
-    # After successful publish, raise exception if there were failures
-    # This marks the DAG as failed
-    if has_failures:
-        raise AirflowFailException(f"DAG failed - automation tasks failed: {', '.join(failed_tasks)}")
-    
-    return "success"
+        logging.error(f"✗ Kafka failed: {e}")
+        return {"status": "failed", "error": str(e)}
 
 
 default_args = {
     "owner": "automiq",
     "start_date": datetime(2025, 1, 1),
     "retries": 0,
-    "retry_delay": timedelta(seconds=20),
 }
 
 with DAG(
@@ -179,7 +170,6 @@ with DAG(
             mkdir -p /workspace && cd /workspace
             git clone http://gitea-http.gitea.svc.cluster.local:3000/admin/automiq-nornir.git repo
             cd repo
-            echo "Target: $TARGET_NAME ($TARGET_IP)"
             python scripts/nornir_ping.py --target $TARGET_NAME
         '''],
         name='nornir-{{ ti.xcom_pull(task_ids="get_netbox_metadata")["target"] | replace(".", "-") | replace("_", "-") }}',
@@ -198,19 +188,10 @@ with DAG(
         cmds=['/bin/bash', '-c'],
         arguments=['''
             set -euo pipefail
-            echo '{{ params.extra_vars }}' > /tmp/extra_vars.json
             mkdir -p /workspace && cd /workspace
             git clone http://gitea-http.gitea.svc.cluster.local:3000/admin/automiq-ansible.git repo
             cd repo
-            if [ ! -f "playbooks/{{ params.playbook }}" ]; then
-              echo "Playbook not found" >&2
-              exit 10
-            fi
-            echo "Running playbook: {{ params.playbook }}"
-            echo "Target: $TARGET_IP"
-            ansible-playbook playbooks/{{ params.playbook }} \
-              -i "$TARGET_IP," \
-              --extra-vars @/tmp/extra_vars.json
+            ansible-playbook playbooks/{{ params.playbook }} -i "$TARGET_IP,"
         '''],
         name='ansible-{{ ti.xcom_pull(task_ids="get_netbox_metadata")["target"] | replace(".", "-") | replace("_", "-") }}',
         env_vars={
@@ -225,6 +206,6 @@ with DAG(
     )
 
     unlock = ward_unlock("{{ params.target }}")
-    notify = publish_completion_event()
+    notify = publish_to_kafka(lock, metadata, nornir, ansible)
 
     lock >> metadata >> nornir >> ansible >> unlock >> notify
