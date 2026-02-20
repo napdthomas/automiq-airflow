@@ -20,6 +20,41 @@ REDIS_PASSWORD = os.getenv("VALKEY_PASSWORD")
 KAFKA_BOOTSTRAP = "automiq-kafka-bootstrap.kafka.svc.cluster.local:9092"
 
 
+def publish_to_kafka(context):
+    """Callback function to publish DAG completion to Kafka"""
+    dag_run = context['dag_run']
+    
+    # Get failed tasks
+    failed_tasks = []
+    for ti in dag_run.get_task_instances():
+        if ti.state in ('failed', 'upstream_failed'):
+            failed_tasks.append(ti.task_id)
+    
+    event = {
+        "dag_id": dag_run.dag_id,
+        "run_id": dag_run.run_id,
+        "state": str(dag_run.state),
+        "failed_tasks": failed_tasks,
+        "start_date": str(dag_run.start_date) if dag_run.start_date else None,
+        "end_date": str(dag_run.end_date) if dag_run.end_date else None,
+        "duration_seconds": (dag_run.end_date - dag_run.start_date).total_seconds() if (dag_run.end_date and dag_run.start_date) else None,
+        "target": dag_run.conf.get("target") if dag_run.conf else None,
+        "playbook": dag_run.conf.get("playbook") if dag_run.conf else None,
+    }
+    
+    try:
+        producer = KafkaProducer(
+            bootstrap_servers=KAFKA_BOOTSTRAP,
+            value_serializer=lambda v: json.dumps(v).encode('utf-8')
+        )
+        future = producer.send('airflow.dag.completed', event)
+        result = future.get(timeout=10)
+        producer.close()
+        logging.info(f"✓ Published to Kafka: partition={result.partition}, offset={result.offset}, state={event['state']}")
+    except Exception as e:
+        logging.error(f"✗ Kafka publish failed: {type(e).__name__}: {e}")
+
+
 def acquire_lock(lock_name: str, ttl: int = 300):
     r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD, db=0)
     if not r.set(lock_name, "locked", nx=True, ex=ttl):
@@ -83,70 +118,6 @@ def get_netbox_metadata(target: str):
     }
 
 
-@task(trigger_rule="all_done")
-def publish_completion_event(**context):
-    """Publish DAG completion event to Kafka for AI agent to process"""
-    from airflow.models import TaskInstance as TI
-    from airflow.settings import Session
-    
-    dag_run = context['dag_run']
-    
-    # Query database for task states
-    session = Session()
-    failed_tasks = []
-    has_failures = False
-    
-    try:
-        task_instances = session.query(TI).filter(
-            TI.dag_id == dag_run.dag_id,
-            TI.run_id == dag_run.run_id,
-            TI.task_id.in_(['ward_lock', 'get_netbox_metadata', 'run_nornir', 'run_ansible'])
-        ).all()
-        
-        failed_tasks = [ti.task_id for ti in task_instances if ti.state == 'failed']
-        has_failures = len(failed_tasks) > 0
-        
-        logging.info(f"Detected task states: {[(ti.task_id, ti.state) for ti in task_instances]}")
-        logging.info(f"Failed tasks: {failed_tasks}")
-    finally:
-        session.close()
-    
-    event = {
-        "dag_id": dag_run.dag_id,
-        "run_id": dag_run.run_id,
-        "state": "failed" if has_failures else "success",
-        "failed_tasks": failed_tasks,
-        "start_date": str(dag_run.start_date) if dag_run.start_date else None,
-        "end_date": str(datetime.utcnow()),
-        "target": dag_run.conf.get("target") if dag_run.conf else None,
-        "playbook": dag_run.conf.get("playbook") if dag_run.conf else None,
-    }
-    
-    # Publish to Kafka first
-    try:
-        producer = KafkaProducer(
-            bootstrap_servers=KAFKA_BOOTSTRAP,
-            value_serializer=lambda v: json.dumps(v).encode('utf-8')
-        )
-        future = producer.send('airflow.dag.completed', event)
-        result = future.get(timeout=10)
-        producer.close()
-        logging.info(f"✓ Published to Kafka: partition={result.partition}, offset={result.offset}")
-    except Exception as e:
-        logging.error(f"✗ Kafka publish failed: {type(e).__name__}: {e}")
-        # Still raise if we had failures
-        if has_failures:
-            raise AirflowFailException(f"DAG failed - tasks failed: {', '.join(failed_tasks)}")
-        raise
-    
-    # After successful publish, raise exception if there were failures
-    # This marks the DAG as failed
-    if has_failures:
-        raise AirflowFailException(f"DAG failed - automation tasks failed: {', '.join(failed_tasks)}")
-    
-    return "success"
-
-
 default_args = {
     "owner": "automiq",
     "start_date": datetime(2025, 1, 1),
@@ -159,6 +130,8 @@ with DAG(
     default_args=default_args,
     schedule=None,
     catchup=False,
+    on_failure_callback=publish_to_kafka,
+    on_success_callback=publish_to_kafka,
     params={
         "target": "clab-netauto-lab-juno1",
         "playbook": "junos_system_baseline.yaml",
@@ -225,6 +198,5 @@ with DAG(
     )
 
     unlock = ward_unlock("{{ params.target }}")
-    notify = publish_completion_event()
 
-    lock >> metadata >> nornir >> ansible >> unlock >> notify
+    lock >> metadata >> nornir >> ansible >> unlock
