@@ -8,8 +8,6 @@ import logging
 import requests
 import redis
 import os
-from kafka import KafkaProducer
-import json
 
 NETBOX_URL = "http://netbox.core.svc.cluster.local/api"
 VAULT_ADDR = "http://vault.core.svc.cluster.local:8200"
@@ -17,7 +15,6 @@ VAULT_TOKEN = os.getenv("VAULT_TOKEN")
 REDIS_HOST = "netbox-valkey-primary.core.svc.cluster.local"
 REDIS_PORT = 6379
 REDIS_PASSWORD = os.getenv("VALKEY_PASSWORD")
-KAFKA_BOOTSTRAP = "automiq-kafka-bootstrap.kafka.svc.cluster.local:9092"
 
 
 def acquire_lock(lock_name: str, ttl: int = 300):
@@ -81,46 +78,6 @@ def get_netbox_metadata(target: str):
         "manufacturer": device.get("device_type", {}).get("manufacturer", {}).get("name", ""),
         "type": device.get("device_type", {}).get("model", ""),
     }
-
-
-@task(trigger_rule="all_done")
-def publish_to_kafka(**context):
-    """Publish DAG completion to Kafka using get_task_instances()"""
-    dag_run = context['dag_run']
-    
-    # Get all task instances for this DAG run
-    task_instances = dag_run.get_task_instances()
-    
-    # Check for failed tasks
-    failed_tasks = [ti.task_id for ti in task_instances 
-                    if ti.state in ('failed', 'upstream_failed')]
-    
-    has_failures = len(failed_tasks) > 0
-    
-    event = {
-        "dag_id": dag_run.dag_id,
-        "run_id": dag_run.run_id,
-        "state": "failed" if has_failures else "success",
-        "failed_tasks": failed_tasks,
-        "start_date": str(dag_run.start_date) if dag_run.start_date else None,
-        "end_date": str(datetime.utcnow()),
-        "target": dag_run.conf.get("target") if dag_run.conf else None,
-        "playbook": dag_run.conf.get("playbook") if dag_run.conf else None,
-    }
-    
-    try:
-        producer = KafkaProducer(
-            bootstrap_servers=KAFKA_BOOTSTRAP,
-            value_serializer=lambda v: json.dumps(v).encode('utf-8')
-        )
-        future = producer.send('airflow.dag.completed', event)
-        result = future.get(timeout=10)
-        producer.close()
-        logging.info(f"✓ Published to Kafka: state={event['state']}, failed_tasks={failed_tasks}")
-        return {"status": "published", "state": event["state"]}
-    except Exception as e:
-        logging.error(f"✗ Kafka publish failed: {e}")
-        raise
 
 
 default_args = {
@@ -190,6 +147,5 @@ with DAG(
     )
 
     unlock = ward_unlock("{{ params.target }}")
-    notify = publish_to_kafka()
 
-    lock >> metadata >> nornir >> ansible >> unlock >> notify
+    lock >> metadata >> nornir >> ansible >> unlock
