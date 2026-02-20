@@ -84,40 +84,24 @@ def get_netbox_metadata(target: str):
 
 
 @task(trigger_rule="all_done")
-def publish_to_kafka(ward_lock_result, metadata_result, nornir_result, ansible_result, **context):
-    """
-    Publish DAG completion to Kafka.
-    Check upstream task results passed as parameters.
-    """
+def publish_to_kafka(**context):
+    """Publish DAG completion to Kafka using get_task_instances()"""
     dag_run = context['dag_run']
-    ti = context['ti']
     
-    # Determine state by checking if critical tasks succeeded
-    # If any upstream task failed, entire run failed
-    critical_tasks = ['ward_lock', 'get_netbox_metadata', 'run_nornir', 'run_ansible']
-    has_failures = False
+    # Get all task instances for this DAG run
+    task_instances = dag_run.get_task_instances()
     
-    for task_id in critical_tasks:
-        task_state = ti.xcom_pull(task_ids=task_id, key='state', default=None)
-        if task_state == 'failed':
-            has_failures = True
-            break
+    # Check for failed tasks
+    failed_tasks = [ti.task_id for ti in task_instances 
+                    if ti.state in ('failed', 'upstream_failed')]
     
-    # If we can't determine from xcom, check task instance states
-    if not has_failures:
-        for task_id in critical_tasks:
-            try:
-                upstream_ti = dag_run.get_task_instance(task_id)
-                if upstream_ti and upstream_ti.state == 'failed':
-                    has_failures = True
-                    break
-            except:
-                pass
+    has_failures = len(failed_tasks) > 0
     
     event = {
         "dag_id": dag_run.dag_id,
         "run_id": dag_run.run_id,
         "state": "failed" if has_failures else "success",
+        "failed_tasks": failed_tasks,
         "start_date": str(dag_run.start_date) if dag_run.start_date else None,
         "end_date": str(datetime.utcnow()),
         "target": dag_run.conf.get("target") if dag_run.conf else None,
@@ -132,11 +116,11 @@ def publish_to_kafka(ward_lock_result, metadata_result, nornir_result, ansible_r
         future = producer.send('airflow.dag.completed', event)
         result = future.get(timeout=10)
         producer.close()
-        logging.info(f"✓ Published to Kafka: {event}")
+        logging.info(f"✓ Published to Kafka: state={event['state']}, failed_tasks={failed_tasks}")
         return {"status": "published", "state": event["state"]}
     except Exception as e:
-        logging.error(f"✗ Kafka failed: {e}")
-        return {"status": "failed", "error": str(e)}
+        logging.error(f"✗ Kafka publish failed: {e}")
+        raise
 
 
 default_args = {
@@ -206,6 +190,6 @@ with DAG(
     )
 
     unlock = ward_unlock("{{ params.target }}")
-    notify = publish_to_kafka(lock, metadata, nornir, ansible)
+    notify = publish_to_kafka()
 
     lock >> metadata >> nornir >> ansible >> unlock >> notify
