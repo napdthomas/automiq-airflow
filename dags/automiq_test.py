@@ -2,8 +2,11 @@
 from airflow import DAG
 from airflow.decorators import task
 from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
-from airflow.exceptions import AirflowFailException
+from airflow.exceptions import AirflowFailException, AirflowSkipException
+from airflow.operators.empty import EmptyOperator
+from airflow.utils.trigger_rule import TriggerRule
 from datetime import datetime, timedelta
+from typing import Optional, Set
 import logging
 import requests
 import redis
@@ -15,6 +18,21 @@ VAULT_TOKEN = os.getenv("VAULT_TOKEN")
 REDIS_HOST = "netbox-valkey-primary.core.svc.cluster.local"
 REDIS_PORT = 6379
 REDIS_PASSWORD = os.getenv("VALKEY_PASSWORD")
+
+
+def has_failed_tasks(context, exclude_tasks: Optional[Set[str]] = None) -> bool:
+    """Check if any tasks in the DAG run have failed"""
+    if exclude_tasks is None:
+        exclude_tasks = {"final_status_check"}
+    
+    dag_run = context["dag_run"]
+    task_instances = dag_run.get_task_instances()
+    failed_states = {"failed", "upstream_failed"}
+    
+    for ti in task_instances:
+        if ti.task_id not in exclude_tasks and ti.state in failed_states:
+            return True
+    return False
 
 
 def acquire_lock(lock_name: str, ttl: int = 300):
@@ -38,7 +56,7 @@ def ward_lock(target: str):
     acquire_lock(f"{target}-lock", ttl=300)
 
 
-@task(trigger_rule="all_done")
+@task
 def ward_unlock(target: str):
     release_lock(f"{target}-lock")
 
@@ -78,6 +96,16 @@ def get_netbox_metadata(target: str):
         "manufacturer": device.get("device_type", {}).get("manufacturer", {}).get("name", ""),
         "type": device.get("device_type", {}).get("model", ""),
     }
+
+
+@task(trigger_rule=TriggerRule.ALL_DONE)
+def final_status_check(**context):
+    """Check if DAG had any failures and raise exception to mark DAG as failed"""
+    if has_failed_tasks(context):
+        raise AirflowFailException("DAG failed - automation tasks failed")
+    
+    logging.info("✓ All automation tasks completed successfully")
+    return "success"
 
 
 default_args = {
@@ -146,6 +174,18 @@ with DAG(
         get_logs=True,
     )
 
-    unlock = ward_unlock("{{ params.target }}")
+    # Teardown pattern ensures unlock always runs
+    unlock = ward_unlock("{{ params.target }}").as_teardown(setups=lock)
+    
+    # Join point before final status check
+    automation_join = EmptyOperator(
+        task_id="automation_join",
+        trigger_rule=TriggerRule.ALL_DONE,
+    )
+    
+    final_check = final_status_check()
 
-    lock >> metadata >> nornir >> ansible >> unlock
+    # DAG flow
+    lock >> metadata >> nornir >> ansible >> automation_join
+    [nornir, ansible] >> unlock
+    automation_join >> final_check
