@@ -85,27 +85,47 @@ def get_netbox_metadata(target: str):
 
 @task(trigger_rule="all_done")
 def publish_to_kafka(**context):
-    """Publish DAG completion to Kafka using get_task_instances()"""
-    dag_run = context['dag_run']
+    """Publish DAG completion to Kafka - query database for DagRun"""
+    from airflow.models import DagRun
+    from airflow.settings import Session
     
-    # Get all task instances for this DAG run
-    task_instances = dag_run.get_task_instances()
+    dag_run_info = context['dag_run']
     
-    # Check for failed tasks
-    failed_tasks = [ti.task_id for ti in task_instances 
-                    if ti.state in ('failed', 'upstream_failed')]
-    
-    has_failures = len(failed_tasks) > 0
+    # Query database to get the actual DagRun object with get_task_instances()
+    session = Session()
+    try:
+        dag_run = session.query(DagRun).filter(
+            DagRun.dag_id == dag_run_info.dag_id,
+            DagRun.run_id == dag_run_info.run_id
+        ).first()
+        
+        if not dag_run:
+            raise Exception(f"DagRun not found: {dag_run_info.run_id}")
+        
+        # Now we can call get_task_instances()
+        task_instances = dag_run.get_task_instances()
+        
+        # Check for failed tasks
+        failed_tasks = [ti.task_id for ti in task_instances 
+                        if ti.state in ('failed', 'upstream_failed')]
+        
+        has_failures = len(failed_tasks) > 0
+        
+        logging.info(f"Task states: {[(ti.task_id, ti.state) for ti in task_instances]}")
+        logging.info(f"Failed tasks: {failed_tasks}")
+        
+    finally:
+        session.close()
     
     event = {
-        "dag_id": dag_run.dag_id,
-        "run_id": dag_run.run_id,
+        "dag_id": dag_run_info.dag_id,
+        "run_id": dag_run_info.run_id,
         "state": "failed" if has_failures else "success",
         "failed_tasks": failed_tasks,
-        "start_date": str(dag_run.start_date) if dag_run.start_date else None,
+        "start_date": str(dag_run_info.start_date) if dag_run_info.start_date else None,
         "end_date": str(datetime.utcnow()),
-        "target": dag_run.conf.get("target") if dag_run.conf else None,
-        "playbook": dag_run.conf.get("playbook") if dag_run.conf else None,
+        "target": dag_run_info.conf.get("target") if dag_run_info.conf else None,
+        "playbook": dag_run_info.conf.get("playbook") if dag_run_info.conf else None,
     }
     
     try:
