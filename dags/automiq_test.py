@@ -19,7 +19,7 @@ REDIS_HOST = "netbox-valkey-primary.core.svc.cluster.local"
 REDIS_PORT = 6379
 REDIS_PASSWORD = os.getenv("VALKEY_PASSWORD")
 
-CAMPAIGN_MANAGER_URL = "http://campaign-manager-service.campaign-manager.svc.cluster.local:8080"
+CAMPAIGN_MANAGER_URL = "http://campaign-manager-backend.campaign-manager.svc.cluster.local:8080"
 
 
 def has_failed_tasks(context, exclude_tasks: Optional[Set[str]] = None) -> bool:
