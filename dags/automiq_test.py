@@ -19,16 +19,18 @@ REDIS_HOST = "netbox-valkey-primary.core.svc.cluster.local"
 REDIS_PORT = 6379
 REDIS_PASSWORD = os.getenv("VALKEY_PASSWORD")
 
+CAMPAIGN_MANAGER_URL = "http://campaign-manager-service.campaign-manager.svc.cluster.local:8080"
+
 
 def has_failed_tasks(context, exclude_tasks: Optional[Set[str]] = None) -> bool:
     """Check if any tasks in the DAG run have failed"""
     if exclude_tasks is None:
-        exclude_tasks = {"final_status_check"}
-    
+        exclude_tasks = {"final_status_check", "notify_success", "notify_failure"}
+
     dag_run = context["dag_run"]
     task_instances = dag_run.get_task_instances()
     failed_states = {"failed", "upstream_failed"}
-    
+
     for ti in task_instances:
         if ti.task_id not in exclude_tasks and ti.state in failed_states:
             return True
@@ -103,9 +105,62 @@ def final_status_check(**context):
     """Check if DAG had any failures and raise exception to mark DAG as failed"""
     if has_failed_tasks(context):
         raise AirflowFailException("DAG failed - automation tasks failed")
-    
+
     logging.info("✓ All automation tasks completed successfully")
     return "success"
+
+
+@task(trigger_rule=TriggerRule.ALL_SUCCESS)
+def notify_success(**context):
+    """
+    Callback to Campaign Manager on full success.
+    Fires only when every upstream task succeeded.
+    """
+    _notify_campaign_manager("SUCCESS", context)
+
+
+@task(trigger_rule=TriggerRule.ONE_FAILED)
+def notify_failure(**context):
+    """
+    Callback to Campaign Manager on any failure.
+    Fires as soon as one upstream task has failed.
+    """
+    _notify_campaign_manager("FAILED", context)
+
+
+def _notify_campaign_manager(status: str, context: dict):
+    """Send status callback to Campaign Manager API."""
+    dag_run   = context["dag_run"]
+    conf      = dag_run.conf or {}
+    campaign_id = conf.get("campaign_id")
+
+    if not campaign_id:
+        logging.warning("[CALLBACK] No campaign_id in dag_run.conf — skipping Campaign Manager notification")
+        return
+
+    candidate = conf.get("target", "unknown")
+    url       = f"{CAMPAIGN_MANAGER_URL}/api/campaigns/{campaign_id}/status"
+
+    payload = {
+        "status":     status,
+        "dag_run_id": dag_run.run_id,
+        "candidate":  candidate,
+        "message":    f"DAG {dag_run.dag_id} run {dag_run.run_id} finished with status {status}",
+    }
+
+    logging.info(f"[CALLBACK] Notifying Campaign Manager | campaign={campaign_id} | candidate={candidate} | status={status}")
+
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        resp.raise_for_status()
+        logging.info(f"[CALLBACK] Campaign Manager acknowledged | response={resp.json()}")
+    except requests.exceptions.ConnectionError as e:
+        # Don't fail the DAG if Campaign Manager is unreachable
+        logging.error(f"[CALLBACK] Could not reach Campaign Manager at {url}: {e}")
+    except requests.exceptions.HTTPError as e:
+        logging.error(f"[CALLBACK] Campaign Manager returned error | status={resp.status_code} | body={resp.text}")
+    except Exception as e:
+        logging.error(f"[CALLBACK] Unexpected error notifying Campaign Manager: {e}")
 
 
 default_args = {
@@ -126,7 +181,7 @@ with DAG(
     },
 ) as dag:
 
-    lock = ward_lock("{{ params.target }}")
+    lock     = ward_lock("{{ params.target }}")
     metadata = get_netbox_metadata("{{ params.target }}")
 
     nornir = KubernetesPodOperator(
@@ -143,7 +198,7 @@ with DAG(
         '''],
         name='nornir-{{ ti.xcom_pull(task_ids="get_netbox_metadata")["target"] | replace(".", "-") | replace("_", "-") }}',
         env_vars={
-            'TARGET_IP': '{{ ti.xcom_pull(task_ids="get_netbox_metadata")["management_ip"] }}',
+            'TARGET_IP':   '{{ ti.xcom_pull(task_ids="get_netbox_metadata")["management_ip"] }}',
             'TARGET_NAME': '{{ ti.xcom_pull(task_ids="get_netbox_metadata")["target"] }}',
         },
         is_delete_operator_pod=False,
@@ -164,11 +219,11 @@ with DAG(
         '''],
         name='ansible-{{ ti.xcom_pull(task_ids="get_netbox_metadata")["target"] | replace(".", "-") | replace("_", "-") }}',
         env_vars={
-            'ANSIBLE_STDOUT_CALLBACK': 'ara_default',
+            'ANSIBLE_STDOUT_CALLBACK':  'ara_default',
             'ANSIBLE_HOST_KEY_CHECKING': 'False',
-            'VAULT_TOKEN': VAULT_TOKEN,
-            'TARGET_IP': '{{ ti.xcom_pull(task_ids="get_netbox_metadata")["management_ip"] }}',
-            'TARGET_NAME': '{{ ti.xcom_pull(task_ids="get_netbox_metadata")["target"] }}',
+            'VAULT_TOKEN':   VAULT_TOKEN,
+            'TARGET_IP':     '{{ ti.xcom_pull(task_ids="get_netbox_metadata")["management_ip"] }}',
+            'TARGET_NAME':   '{{ ti.xcom_pull(task_ids="get_netbox_metadata")["target"] }}',
         },
         is_delete_operator_pod=False,
         get_logs=True,
@@ -176,16 +231,22 @@ with DAG(
 
     # Teardown pattern ensures unlock always runs
     unlock = ward_unlock("{{ params.target }}").as_teardown(setups=lock)
-    
+
     # Join point before final status check
     automation_join = EmptyOperator(
         task_id="automation_join",
         trigger_rule=TriggerRule.ALL_DONE,
     )
-    
-    final_check = final_status_check()
+
+    final_check      = final_status_check()
+    notify_success_t = notify_success()
+    notify_failure_t = notify_failure()
 
     # DAG flow
     lock >> metadata >> nornir >> ansible >> automation_join
     [nornir, ansible] >> unlock
     automation_join >> final_check
+
+    # Callbacks fire after final_check resolves
+    # notify_success only if final_check passed; notify_failure if it raised
+    final_check >> [notify_success_t, notify_failure_t]
